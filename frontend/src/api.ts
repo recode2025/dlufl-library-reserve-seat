@@ -57,9 +57,8 @@ export const api = {
       ),
     submitIntranetLogin: (payload: {
       token: string;
-      rsa: string;
-      ul: number;
-      pl: number;
+      username: string;
+      password: string;
       execution: string;
     }) =>
       request<{ success: boolean; ticket: string; redirectUrl: string }>('/api/auth/cas/submit', {

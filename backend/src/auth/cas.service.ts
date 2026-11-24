@@ -6,6 +6,7 @@ import * as xml2js from 'xml2js';
 import type { Request } from 'express';
 import { appConfig } from '../config/app.config';
 import { DatabaseService, UserRow } from '../database/database.service';
+import { strEnc } from './des';
 
 export interface CasAttributes {
   user_id: string;
@@ -319,14 +320,16 @@ export class CasService {
   }
 
   /**
-   * 内网/无跳转兜底流程第 2 步：提交 DES 加密凭据换取 ST 票据（参照 hydrooj-oauth-dlufl）。
+   * 内网/无跳转兜底流程第 2 步：在服务端完成 DES 编码并向 CAS 换取 ST 票据（前端不暴露 des.js）。
    */
   async submitIntranetLogin(payload: {
     token: string;
-    rsa: string;
-    ul: string;
-    pl: string;
     execution: string;
+    username?: string;
+    password?: string;
+    rsa?: string;
+    ul?: string;
+    pl?: string;
   }): Promise<CasResult<{ ticket: string; serviceUrl: string }>> {
     const row = this.dbService.db
       .prepare(`SELECT * FROM cas_login_tokens WHERE token = ?`)
@@ -351,13 +354,29 @@ export class CasService {
     // 一次性使用，立即销毁
     this.dbService.db.prepare(`DELETE FROM cas_login_tokens WHERE token = ?`).run(row.token);
 
+    let rsa = payload.rsa || '';
+    let ul = payload.ul || '';
+    let pl = payload.pl || '';
+
+    if (payload.username && payload.password) {
+      const uname = payload.username.trim();
+      const pwd = payload.password;
+      rsa = strEnc(`${uname}${pwd}${row.lt}`, '1', '2', '3');
+      ul = String(uname.length);
+      pl = String(pwd.length);
+    }
+
+    if (!rsa || !ul || !pl) {
+      return { success: false, message: '缺少必要的账号密码认证参数' };
+    }
+
     try {
       const loginResponse: AxiosResponse = await axios.post(
         `${this.getCasLoginBaseUrl()}?service=${encodeURIComponent(row.service_url)}`,
         new URLSearchParams({
-          rsa: payload.rsa,
-          ul: String(payload.ul),
-          pl: String(payload.pl),
+          rsa,
+          ul: String(ul),
+          pl: String(pl),
           lt: row.lt,
           execution: row.execution,
           _eventId: 'submit',

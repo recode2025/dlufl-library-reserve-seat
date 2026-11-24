@@ -3,12 +3,6 @@ import { ExternalLink, KeyRound, Lock, RefreshCw, ShieldCheck, X } from 'lucide-
 import { api } from '../api';
 import type { AuthConfigResponse, UserProfile } from '../types';
 
-declare global {
-  interface Window {
-    strEnc?: (data: string, k1: string, k2: string, k3: string) => string;
-  }
-}
-
 interface LoginModalProps {
   open: boolean;
   onClose: () => void;
@@ -48,20 +42,14 @@ export const LoginModal: React.FC<LoginModalProps> = ({
       setError('请输入学号/工号与密码');
       return;
     }
-    if (typeof window.strEnc !== 'function') {
-      setError('DES 加密模块未加载完成，请刷新页面后重试');
-      return;
-    }
 
     setLoading(true);
     try {
       const tokenRes = await api.auth.getIntranetToken();
-      const rsa = window.strEnc(username.trim() + password + tokenRes.lt, '1', '2', '3');
       const submitRes = await api.auth.submitIntranetLogin({
         token: tokenRes.token,
-        rsa,
-        ul: username.trim().length,
-        pl: password.length,
+        username: username.trim(),
+        password,
         execution: tokenRes.execution,
       });
       // 走标准服务端 /api/auth/cas/callback?ticket=... 完成票据验证与 Cookie 签发
@@ -137,7 +125,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
                   : 'border-transparent text-[#4D627A] hover:text-[#0D223D]'
               }`}
             >
-              内网 DES 加密直连
+              内网服务端直连
             </button>
           </div>
         </div>
@@ -189,8 +177,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
           ) : (
             <form onSubmit={handleIntranetSubmit} className="space-y-4">
               <p className="text-xs leading-relaxed text-[#4D627A]">
-                当客户端位于校园内网或无法直接打开外网 CAS 页面时，可使用前端 DES 加密凭据换取
-                ST 票据并走同一回调验证链路。
+                当客户端位于校园内网或无法直接打开外网 CAS 页面时，可通过 HTTPS 将凭据提交至后端服务端安全完成 CAS 协议编码并换取 ST 票据（前端不暴露任何加密脚本）。
               </p>
               <div>
                 <label className="mb-1.5 block text-sm font-medium text-[#0D223D]">学号 / 工号</label>
@@ -209,7 +196,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
                   type="password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  placeholder="浏览器本地 DES 加密传输"
+                  placeholder="通过 HTTPS 提交至服务端安全认证"
                   className="w-full rounded-lg border border-[#CBD5E1] px-3.5 py-2.5 text-sm outline-none focus:border-[#0D386B] focus:ring-2 focus:ring-[#0D386B]/15"
                   required
                 />

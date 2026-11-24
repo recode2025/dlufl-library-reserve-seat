@@ -195,28 +195,34 @@ export class AuthController {
   }
 
   /**
-   * 内网/备选 DES 加密登录提交接口（参照 hydrooj-oauth-dlufl 的 SubmitHandler）。
+   * 内网/备选登录提交接口：由服务端安全完成 CAS 协议编码并换取 ST 票据。
    */
   @Post('cas/submit')
   async submitIntranetLogin(
     @Body()
     body: {
       token?: string;
+      execution?: string;
+      username?: string;
+      password?: string;
       rsa?: string;
       ul?: string | number;
       pl?: string | number;
-      execution?: string;
     },
   ) {
-    if (!body?.token || !body?.rsa || !body?.ul || !body?.pl || !body?.execution) {
-      throw new BadRequestException('缺少必要的 CAS 加密登录参数');
+    const hasPlain = Boolean(body?.username && body?.password);
+    const hasPreEncoded = Boolean(body?.rsa && body?.ul && body?.pl);
+    if (!body?.token || !body?.execution || (!hasPlain && !hasPreEncoded)) {
+      throw new BadRequestException('缺少必要的 CAS 登录参数');
     }
     const result = await this.casService.submitIntranetLogin({
       token: String(body.token),
-      rsa: String(body.rsa),
-      ul: String(body.ul),
-      pl: String(body.pl),
       execution: String(body.execution),
+      username: body.username ? String(body.username) : undefined,
+      password: body.password ? String(body.password) : undefined,
+      rsa: body.rsa ? String(body.rsa) : undefined,
+      ul: body.ul !== undefined ? String(body.ul) : undefined,
+      pl: body.pl !== undefined ? String(body.pl) : undefined,
     });
     if (!result.success) {
       throw new BadRequestException(result.message);
