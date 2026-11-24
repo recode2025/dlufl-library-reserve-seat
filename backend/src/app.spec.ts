@@ -407,4 +407,30 @@ describe('DLUFL Library System Core Flows', () => {
       if (fs.existsSync(sqlJsPath)) fs.unlinkSync(sqlJsPath);
     }
   });
+
+  it('converts upstream ICSpace / session errors in fetchAreaSeats into clean HttpExceptions instead of 500', async () => {
+    const user = casService.upsertUserFromCas({
+      user_id: 'u_err_test',
+      id_number: '20249999',
+      user_name: '异常测试',
+      unit_name: '软件学院',
+      id_type: '1',
+    });
+    const boundUser = {
+      ...user,
+      icspace_bound: 1,
+      encrypted_cas_password: 'invalid-cipher-payload',
+    };
+
+    const prevMock = appConfig.mockMode;
+    try {
+      appConfig.mockMode = false;
+      await assert.rejects(
+        () => icspService.fetchAreaSeats(boundUser, '100475787', '2026-11-25', '08:30', '22:00'),
+        (err: any) => err?.getStatus?.() === 400 && /解密失败/.test(err?.message || ''),
+      );
+    } finally {
+      appConfig.mockMode = prevMock;
+    }
+  });
 });

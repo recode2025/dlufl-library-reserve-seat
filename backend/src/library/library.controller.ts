@@ -4,7 +4,6 @@ import {
   Controller,
   Delete,
   Get,
-  NotFoundException,
   Param,
   ParseIntPipe,
   Patch,
@@ -45,7 +44,7 @@ export class LibraryController {
   ) {
     const img = await this.icspService.getAreaFloorPlanImage(req.user, areaId);
     if (!img) {
-      throw new NotFoundException('暂未获取到该区域平面底图');
+      return res.status(404).json({ statusCode: 404, message: '暂未获取到该区域平面底图' });
     }
     res.setHeader('ETag', img.etag);
     res.setHeader('Cache-Control', 'public, max-age=86400');

@@ -1,4 +1,10 @@
-import { BadRequestException, Injectable, Logger } from '@nestjs/common';
+import {
+  BadRequestException,
+  HttpException,
+  Injectable,
+  Logger,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import axios, { AxiosInstance } from 'axios';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
@@ -357,7 +363,14 @@ export class IcspService {
       );
     }
 
-    const plainPwd = decryptSecret(user.encrypted_cas_password);
+    let plainPwd: string;
+    try {
+      plainPwd = decryptSecret(user.encrypted_cas_password);
+    } catch {
+      throw new BadRequestException(
+        '图书馆授权凭证解密失败（可能服务端加密密钥已变更），请在右上角重新授权 ICSpace 密码',
+      );
+    }
     const fresh = await this.authenticateIcspace(user.student_id, plainPwd);
     const now = new Date().toISOString();
     this.dbService.db
@@ -1172,25 +1185,52 @@ export class IcspService {
         };
       }
     } else if (!rawList && user) {
+      let lastError: unknown;
       for (let attempt = 0; attempt < 2; attempt++) {
-        const session = await this.ensureUserSession(user, attempt > 0);
-        const client = this.createClientFromCookies(session.cookies);
-        const response = await client.get(apiUrl);
-        if (response.data?.code === 0 && Array.isArray(response.data?.data)) {
-          const list: any[] = response.data.data;
-          rawList = list;
-          this.areaRawCache.set(cacheKey, { data: list, fetchedAt: Date.now() });
-          break;
-        }
-        // 认证过期自动刷新重登一次
-        if (attempt === 0) {
-          this.logger.warn(
-            `ICSpace seats fetch returned code=${response.data?.code} (${response.data?.message}), refreshing session...`,
+        try {
+          const session = await this.ensureUserSession(user, attempt > 0);
+          const client = this.createClientFromCookies(session.cookies);
+          const response = await client.get(apiUrl);
+          if (response.data?.code === 0 && Array.isArray(response.data?.data)) {
+            const list: any[] = response.data.data;
+            rawList = list;
+            this.areaRawCache.set(cacheKey, { data: list, fetchedAt: Date.now() });
+            break;
+          }
+          // 认证过期自动刷新重登一次
+          if (attempt === 0) {
+            this.logger.warn(
+              `ICSpace seats fetch returned code=${response.data?.code} (${response.data?.message}), refreshing session...`,
+            );
+            continue;
+          }
+          throw new BadRequestException(
+            `获取图书馆座位失败: ${response.data?.message || 'ICSpace 接口异常'}`,
           );
-          continue;
+        } catch (err: any) {
+          if (err instanceof HttpException) {
+            throw err;
+          }
+          lastError = err;
+          this.logger.warn(
+            `ICSpace seats fetch attempt ${attempt + 1} failed for area ${area.id}: ${err?.message || err}`,
+          );
+          if (attempt === 0) {
+            continue;
+          }
         }
-        throw new BadRequestException(
-          `获取图书馆座位失败: ${response.data?.message || 'ICSpace 接口异常'}`,
+      }
+
+      if (!rawList) {
+        const msg =
+          lastError instanceof Error && lastError.message
+            ? lastError.message
+            : 'ICSpace 上游服务暂时不可用';
+        if (/密码|身份认证|授权|解密/.test(msg)) {
+          throw new BadRequestException(`图书馆身份校验失败：${msg}`);
+        }
+        throw new ServiceUnavailableException(
+          `连接图书馆 ICSpace 接口超时或异常，请稍后重试（${msg}）`,
         );
       }
     }
