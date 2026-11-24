@@ -54,13 +54,16 @@ export class CasService {
     return `${appConfig.cas.serverUrl}${appConfig.cas.logoutPath}?service=${encodeURIComponent(returnUrl)}&_t=${Date.now()}`;
   }
 
+  private isLocalhostUrl(url: string): boolean {
+    return /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i.test(url);
+  }
+
   /**
    * 规范化外部访问 Origin，保证 /cas/login 与 /cas/proxyValidate 使用完全一致的 service URL。
+   * 优先自动跟随 Nginx / 反向代理透传的 X-Forwarded-Proto + Host（对齐 hydrooj-oauth-dlufl），
+   * 防止 .env 残留 localhost 占位符导致线上回调跳错地址。
    */
   getCanonicalOrigin(req: Request): string {
-    if (appConfig.publicBaseUrl) {
-      return appConfig.publicBaseUrl;
-    }
     const rawProto = req.headers['x-forwarded-proto'];
     const proto = Array.isArray(rawProto)
       ? rawProto[0]
@@ -71,7 +74,13 @@ export class CasService {
       ? rawHost[0]
       : String(rawHost || `localhost:${appConfig.port}`).split(',')[0].trim();
 
-    return `${proto}://${host}`;
+    const reqOrigin = `${proto}://${host}`;
+    const configured = appConfig.publicBaseUrl;
+
+    if (configured && (!this.isLocalhostUrl(configured) || this.isLocalhostUrl(reqOrigin))) {
+      return configured;
+    }
+    return reqOrigin;
   }
 
   getCallbackUrl(req: Request): string {
@@ -79,10 +88,12 @@ export class CasService {
   }
 
   getFrontendBaseUrl(req: Request): string {
-    if (appConfig.frontendUrl) {
-      return appConfig.frontendUrl;
+    const canonical = this.getCanonicalOrigin(req);
+    const configured = appConfig.frontendUrl;
+    if (configured && (!this.isLocalhostUrl(configured) || this.isLocalhostUrl(canonical))) {
+      return configured;
     }
-    return this.getCanonicalOrigin(req);
+    return canonical;
   }
 
   sanitizeReturnTo(raw?: string): string {

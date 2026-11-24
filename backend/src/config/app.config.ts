@@ -63,7 +63,7 @@ function parseList(raw: string | undefined, fallback: string[]): string[] {
 export const appConfig = {
   port: Number(process.env.PORT || 18301),
   publicBaseUrl: (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, ''),
-  frontendUrl: (process.env.FRONTEND_URL || 'http://localhost:18517').replace(/\/+$/, ''),
+  frontendUrl: (process.env.FRONTEND_URL || '').replace(/\/+$/, ''),
   jwtSecret: process.env.JWT_SECRET || 'dlufl-library-jwt-secret-dev-2026',
   credentialEncryptionKey:
     process.env.CREDENTIAL_ENCRYPTION_KEY || 'dlufl-library-aes-key-32-chars-min-2026',

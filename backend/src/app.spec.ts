@@ -94,6 +94,30 @@ describe('DLUFL Library System Core Flows', () => {
       true,
     );
     assert.ok(renewUrl.includes('renew=true'));
+
+    // 验证 Nginx 代理头透传公网域名时，即使 .env 残留 localhost，也不会跳回 localhost:18517
+    const prevPub = appConfig.publicBaseUrl;
+    const prevFe = appConfig.frontendUrl;
+    try {
+      appConfig.publicBaseUrl = 'http://localhost:18517';
+      appConfig.frontendUrl = 'http://localhost:18517';
+      const fakeReq: any = {
+        protocol: 'http',
+        headers: {
+          'x-forwarded-proto': 'https',
+          'x-forwarded-host': 'lib.example.edu.cn',
+          host: '127.0.0.1:18301',
+        },
+      };
+      assert.equal(
+        casService.getCallbackUrl(fakeReq),
+        'https://lib.example.edu.cn/api/auth/cas/callback',
+      );
+      assert.equal(casService.getFrontendBaseUrl(fakeReq), 'https://lib.example.edu.cn');
+    } finally {
+      appConfig.publicBaseUrl = prevPub;
+      appConfig.frontendUrl = prevFe;
+    }
   });
 
   it('supports area seat browsing, manual booking, visit metrics, and card query', async () => {
