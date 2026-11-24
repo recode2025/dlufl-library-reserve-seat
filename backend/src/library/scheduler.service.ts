@@ -15,6 +15,11 @@ import {
 import { IcspService } from './icspace.service';
 import { CasService } from '../auth/cas.service';
 
+export const POLL_INTERVAL_MIN_SEC = 5;
+export const POLL_INTERVAL_MAX_SEC = 60;
+export const POLL_INTERVAL_DEFAULT_SEC = 10;
+export const MAX_TASKS_PER_USER = 5;
+
 export interface CreateScheduleDto {
   name: string;
   areaIds: string[];
@@ -215,7 +220,24 @@ export class SchedulerService implements OnModuleInit {
       .all(taskId) as unknown as TaskLogRow[];
   }
 
+  private clampPollInterval(raw: unknown, fallback = POLL_INTERVAL_DEFAULT_SEC): number {
+    const num = Number(raw);
+    if (Number.isNaN(num) || !Number.isFinite(num)) return fallback;
+    return Math.max(POLL_INTERVAL_MIN_SEC, Math.min(POLL_INTERVAL_MAX_SEC, Math.round(num)));
+  }
+
   createTask(user: UserRow, dto: CreateScheduleDto) {
+    const existingCount = (
+      this.dbService.db
+        .prepare(`SELECT COUNT(*) as cnt FROM scheduled_tasks WHERE user_id = ?`)
+        .get(user.id) as { cnt: number }
+    ).cnt;
+    if (existingCount >= MAX_TASKS_PER_USER) {
+      throw new BadRequestException(
+        `为保护图书馆接口稳定，每位用户最多可创建 ${MAX_TASKS_PER_USER} 个定期抢座任务`,
+      );
+    }
+
     if (!dto.areaIds || dto.areaIds.length === 0) {
       throw new BadRequestException('请至少选择一个目标预约区域');
     }
@@ -239,7 +261,7 @@ export class SchedulerService implements OnModuleInit {
       .filter((n) => !Number.isNaN(n) && n > 0);
 
     const enabled = dto.enabled !== false ? 1 : 0;
-    const pollIntervalSec = Math.max(2, Math.min(300, Number(dto.pollIntervalSec || 5)));
+    const pollIntervalSec = this.clampPollInterval(dto.pollIntervalSec);
     const maxPollMinutes = Math.max(0, Math.min(1440, Number(dto.maxPollMinutes ?? 180)));
 
     const res = this.dbService.db
@@ -337,8 +359,8 @@ export class SchedulerService implements OnModuleInit {
         patch.weekdays !== undefined ? JSON.stringify(patch.weekdays) : existing.weekdays_json,
         patch.isRecurring !== undefined ? (patch.isRecurring ? 1 : 0) : existing.is_recurring,
         patch.pollIntervalSec !== undefined
-          ? Math.max(2, Number(patch.pollIntervalSec))
-          : existing.poll_interval_sec,
+          ? this.clampPollInterval(patch.pollIntervalSec, existing.poll_interval_sec)
+          : this.clampPollInterval(existing.poll_interval_sec),
         patch.maxPollMinutes !== undefined
           ? Math.max(0, Number(patch.maxPollMinutes))
           : existing.max_poll_minutes,
@@ -484,11 +506,12 @@ export class SchedulerService implements OnModuleInit {
         }
       }
 
-      // 2) 检查正在轮询中的任务是否到达下一次轮询间隔
+      // 2) 检查正在轮询中的任务是否到达下一次轮询间隔（强制服务端下限保护 5–60s）
       if (task.status === 'polling') {
         const lastRunMs = task.last_run_at ? new Date(task.last_run_at).getTime() : 0;
         const elapsedSec = (now.getTime() - lastRunMs) / 1000;
-        if (elapsedSec >= Math.max(2, task.poll_interval_sec)) {
+        const safeInterval = this.clampPollInterval(task.poll_interval_sec);
+        if (elapsedSec >= safeInterval) {
           void this.executePollingAttempt(task, false);
         }
       }

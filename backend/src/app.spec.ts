@@ -213,9 +213,10 @@ describe('DLUFL Library System Core Flows', () => {
       targetDayOffset: 1,
       weekdays: [0, 1, 2, 3, 4, 5, 6],
       isRecurring: true,
-      pollIntervalSec: 2,
+      pollIntervalSec: 1, // 故意传低于下限的值，验证服务端强制收紧为 5 秒
       maxPollMinutes: 0,
     });
+    assert.equal(task.pollIntervalSec, 5);
 
     // 先模拟第 1 次扫描无座 -> 验证保持 polling 状态并累计 pollAttempts
     const origFind = icspService.findBestSeatCandidate.bind(icspService);
@@ -245,12 +246,12 @@ describe('DLUFL Library System Core Flows', () => {
       assert.equal(afterFirst.pollAttempts, 1);
       assert.equal(afterFirst.activeTargetDate, expectedTarget);
 
-      // 模拟 4 秒后轮询下一拍 -> 发现空位并成功约上
-      const pollNow = new Date(triggerNow.getTime() + 4000);
-      // 确保 last_run_at 距今超过 poll_interval_sec
+      // 模拟 6 秒后轮询下一拍 -> 发现空位并成功约上
+      const pollNow = new Date(triggerNow.getTime() + 6000);
+      // 确保 last_run_at 距今超过 poll_interval_sec (5s)
       dbService.db
         .prepare(`UPDATE scheduled_tasks SET last_run_at = ? WHERE id = ?`)
-        .run(new Date(pollNow.getTime() - 5000).toISOString(), task.id);
+        .run(new Date(pollNow.getTime() - 6000).toISOString(), task.id);
 
       await schedulerService.processScheduledTick(pollNow);
       await new Promise((r) => setTimeout(r, 80));

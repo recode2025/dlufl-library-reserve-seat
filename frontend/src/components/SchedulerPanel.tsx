@@ -62,7 +62,7 @@ export const SchedulerPanel: React.FC<SchedulerPanelProps> = ({
   const [isRecurring, setIsRecurring] = useState(true);
   const [minFreeRate, setMinFreeRate] = useState(80);
   const [forceFullRange, setForceFullRange] = useState(false);
-  const [pollIntervalSec, setPollIntervalSec] = useState(5);
+  const [pollIntervalSec, setPollIntervalSec] = useState(10);
   const [maxPollMinutes, setMaxPollMinutes] = useState(0); // 0 = 持续轮询直到约上
 
   useEffect(() => {
@@ -434,30 +434,46 @@ export const SchedulerPanel: React.FC<SchedulerPanelProps> = ({
 
           <div className="grid grid-cols-2 gap-3 rounded-lg border border-[#DCE4EE] bg-[#F8FAFC] p-3">
             <div>
-              <label className="mb-1 block text-xs font-medium text-[#4D627A]">
-                无座轮询间隔（秒）
+              <label className="mb-1 flex items-center justify-between text-xs font-medium text-[#4D627A]">
+                <span>无座轮询间隔</span>
+                <span className="font-mono font-semibold text-[#0D386B]">{pollIntervalSec} 秒</span>
               </label>
               <input
-                type="number"
-                min={2}
-                max={120}
+                type="range"
+                min={5}
+                max={60}
+                step={5}
                 value={pollIntervalSec}
                 onChange={(e) => setPollIntervalSec(Number(e.target.value))}
-                className="w-full rounded-lg border border-[#CBD5E1] bg-white px-2.5 py-1.5 font-mono text-sm"
+                className="mt-1.5 w-full accent-[#0D386B]"
               />
+              <div className="mt-0.5 flex justify-between font-mono text-[10px] text-[#64748B]">
+                <span>5s (高频)</span>
+                <span>30s</span>
+                <span>60s (温和)</span>
+              </div>
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-[#4D627A]">
-                轮询上限（0=直到约上）
+              <label className="mb-1 flex items-center justify-between text-xs font-medium text-[#4D627A]">
+                <span>轮询上限</span>
+                <span className="font-mono font-semibold text-[#0D386B]">
+                  {maxPollMinutes === 0 ? '直到约上' : `${maxPollMinutes} 分钟`}
+                </span>
               </label>
               <input
-                type="number"
+                type="range"
                 min={0}
-                max={1440}
+                max={360}
+                step={30}
                 value={maxPollMinutes}
                 onChange={(e) => setMaxPollMinutes(Number(e.target.value))}
-                className="w-full rounded-lg border border-[#CBD5E1] bg-white px-2.5 py-1.5 font-mono text-sm"
+                className="mt-1.5 w-full accent-[#0D386B]"
               />
+              <div className="mt-0.5 flex justify-between font-mono text-[10px] text-[#64748B]">
+                <span>不限</span>
+                <span>3h</span>
+                <span>6h</span>
+              </div>
             </div>
             <div>
               <label className="mb-1 block text-xs font-medium text-[#4D627A]">

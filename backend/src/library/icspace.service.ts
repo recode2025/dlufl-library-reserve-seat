@@ -56,6 +56,9 @@ export interface ReserveSeatResult {
 export class IcspService {
   private readonly logger = new Logger(IcspService.name);
   private readonly sessionCache = new Map<number, CachedIcspaceSession>();
+  // 上游房间座位快照 3 秒合并缓存：多用户同时刷新/轮询同一区域时，每 3 秒最多向上游 ICSpace 发起 1 次请求，防限流封禁
+  private readonly areaRawCache = new Map<string, { data: any[]; fetchedAt: number }>();
+  private readonly AREA_CACHE_TTL_MS = 3000;
 
   constructor(private readonly dbService: DatabaseService) {}
 
@@ -678,11 +681,18 @@ export class IcspService {
     const endMin = calibratedRange.effectiveEndMin;
     const compactDate = targetDate.replace(/-/g, '');
     const apiUrl = `${appConfig.icspace.host}/ic-web/reserve?roomIds=${area.id}&resvDates=${compactDate}&sysKind=8&_=${Date.now()}`;
+    const cacheKey = `${area.id}:${compactDate}`;
 
     let rawList: any[] | null = null;
-    let isGuestPreview = false;
+    let isGuestPreview = !user || !user.icspace_bound;
 
-    if (!user || !user.icspace_bound) {
+    // 优先命中 3 秒上游合并缓存，避免多人高并发轮询同一区域打爆校园网 ICSpace
+    const cachedSnapshot = this.areaRawCache.get(cacheKey);
+    if (cachedSnapshot && Date.now() - cachedSnapshot.fetchedAt < this.AREA_CACHE_TTL_MS) {
+      rawList = cachedSnapshot.data;
+    }
+
+    if (!rawList && (!user || !user.icspace_bound)) {
       isGuestPreview = true;
       // 1) 未登录/未绑定时，先尝试公开接口直拉 ICSpace 座位状态
       try {
@@ -691,7 +701,9 @@ export class IcspService {
           timeout: 10000,
         });
         if (pubResp.data?.code === 0 && Array.isArray(pubResp.data?.data)) {
-          rawList = pubResp.data.data;
+          const list: any[] = pubResp.data.data;
+          rawList = list;
+          this.areaRawCache.set(cacheKey, { data: list, fetchedAt: Date.now() });
         }
       } catch {
         // ignore anonymous error and try cached public reader session
@@ -712,7 +724,9 @@ export class IcspService {
               const client = this.createClientFromCookies(session.cookies);
               const response = await client.get(apiUrl);
               if (response.data?.code === 0 && Array.isArray(response.data?.data)) {
-                rawList = response.data.data;
+                const list: any[] = response.data.data;
+                rawList = list;
+                this.areaRawCache.set(cacheKey, { data: list, fetchedAt: Date.now() });
                 break;
               }
             } catch {
@@ -740,13 +754,15 @@ export class IcspService {
           seats: [],
         };
       }
-    } else {
+    } else if (!rawList && user) {
       for (let attempt = 0; attempt < 2; attempt++) {
         const session = await this.ensureUserSession(user, attempt > 0);
         const client = this.createClientFromCookies(session.cookies);
         const response = await client.get(apiUrl);
         if (response.data?.code === 0 && Array.isArray(response.data?.data)) {
-          rawList = response.data.data;
+          const list: any[] = response.data.data;
+          rawList = list;
+          this.areaRawCache.set(cacheKey, { data: list, fetchedAt: Date.now() });
           break;
         }
         // 认证过期自动刷新重登一次
@@ -1020,6 +1036,7 @@ export class IcspService {
     }
 
     if (success) {
+      this.areaRawCache.delete(`${params.areaId}:${params.targetDate.replace(/-/g, '')}`);
       this.dbService.incrementMetric('total_successful_bookings', 1);
     }
 

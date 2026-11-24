@@ -77,9 +77,9 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
     null,
   );
 
-  // 预约页面内置「自动刷新轮询找座直到约上」状态
+  // 预约页面内置「自动刷新轮询找座直到约上」状态（可控范围 5–60 秒滑块）
   const [isPollingGrab, setIsPollingGrab] = useState(false);
-  const [pollIntervalSec, setPollIntervalSec] = useState(5);
+  const [pollIntervalSec, setPollIntervalSec] = useState(10);
   const [pollAllowPartial, setPollAllowPartial] = useState(true);
   const [pollLockSeat, setPollLockSeat] = useState(false);
   const [pollAttempts, setPollAttempts] = useState(0);
@@ -238,10 +238,11 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
 
   useEffect(() => {
     if (!isPollingGrab) return;
+    const safeSec = Math.max(5, Math.min(60, pollIntervalSec));
     void executeSinglePollCycle();
     const timer = window.setInterval(() => {
       void executeSinglePollCycle();
-    }, Math.max(2, pollIntervalSec) * 1000);
+    }, safeSec * 1000);
     return () => window.clearInterval(timer);
   }, [isPollingGrab, pollIntervalSec, executeSinglePollCycle]);
 
@@ -583,17 +584,24 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
             </div>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2.5 text-xs">
-            <select
-              value={pollIntervalSec}
-              onChange={(e) => setPollIntervalSec(Number(e.target.value))}
-              disabled={isPollingGrab}
-              className="rounded-lg border border-[#CBD5E1] bg-white px-2 py-1.5 font-mono text-xs text-[#0D223D] disabled:opacity-60"
-            >
-              <option value={3}>每 3 秒</option>
-              <option value={5}>每 5 秒</option>
-              <option value={10}>每 10 秒</option>
-            </select>
+          <div className="flex flex-wrap items-center gap-3 text-xs">
+            <div className="flex items-center gap-2 rounded-lg border border-[#DCE4EE] bg-white px-2.5 py-1.5">
+              <span className="text-[#4D627A]">轮询间隔</span>
+              <input
+                type="range"
+                min={5}
+                max={60}
+                step={5}
+                value={pollIntervalSec}
+                onChange={(e) => setPollIntervalSec(Number(e.target.value))}
+                disabled={isPollingGrab}
+                className="w-24 accent-[#0D386B] disabled:opacity-60"
+                aria-label="轮询间隔（5到60秒）"
+              />
+              <span className="w-8 text-right font-mono font-semibold text-[#0D386B]">
+                {pollIntervalSec}s
+              </span>
+            </div>
 
             <label className="inline-flex cursor-pointer items-center gap-1.5 text-[#0D223D]">
               <input
