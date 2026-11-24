@@ -120,7 +120,7 @@ export default function App() {
   ];
 
   return (
-    <div className="min-h-screen bg-[#F3F6FA] text-[#0D223D]">
+    <div className="flex min-h-screen flex-col bg-[#F3F6FA] text-[#0D223D]">
       {/* Top Institutional Bar */}
       <header className="sticky top-0 z-40 border-b border-[#DCE4EE] bg-white/95 backdrop-blur">
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-4 py-3 sm:px-6">
@@ -241,7 +241,7 @@ export default function App() {
       </header>
 
       {/* Main Container */}
-      <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6">
+      <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-6 sm:px-6">
         {authError && (
           <div className="mb-5 flex items-center justify-between rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
             <div className="flex items-center gap-2">
@@ -298,8 +298,8 @@ export default function App() {
         {activeTab === 'cards' && <CardQueryPanel user={user} />}
       </main>
 
-      <footer className="mt-10 border-t border-[#DCE4EE] bg-white py-5 text-center text-xs text-[#64748B]">
-        <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-2 px-4 sm:px-6">
+      <footer className="mt-auto w-full border-t border-[#DCE4EE] bg-white py-4 text-xs text-[#64748B]">
+        <div className="flex w-full flex-wrap items-center justify-between gap-2 px-4 sm:px-6">
           <span>大连外国语大学图书馆座位预约与定时抢座系统 · NestJS + React</span>
           <span className="font-mono">
             累计成功约座 {overview?.totalSuccessfulBookings ?? 0} 次 · 系统累计访问{' '}
