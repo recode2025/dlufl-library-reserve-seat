@@ -226,7 +226,7 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
 
         <div className="rounded-xl border border-[#DCE4EE] bg-white p-5">
           <div className="flex items-center justify-between text-[#4D627A]">
-            <span className="text-sm font-medium">已认证师生账号</span>
+            <span className="text-sm font-medium">已授权约座账号</span>
             <Award className="h-5 w-5 text-[#DF7900]" />
           </div>
           <div className="mt-3 flex items-baseline gap-2.5">
@@ -235,7 +235,9 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
             </span>
             <span className="text-xs text-[#4D627A]">覆盖 {areas.length} 个阅览区域</span>
           </div>
-          <p className="mt-1.5 text-xs text-[#64748B]">统一经由 cas.dlufl.edu.cn 校验身份</p>
+          <p className="mt-1.5 text-xs text-[#64748B]">
+            当前有效绑定 ICSpace 师生数（解绑实时扣减）
+          </p>
         </div>
       </section>
 

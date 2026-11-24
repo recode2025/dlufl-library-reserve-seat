@@ -249,6 +249,13 @@ describe('DLUFL Library System Core Flows', () => {
     const overview = statsService.getOverview(user);
     assert.ok(overview.totalSuccessfulBookings >= 1);
     assert.ok(overview.totalVisits >= 2);
+    assert.equal(overview.registeredUsers, 1);
+
+    // 验证解绑后统计立即扣减为 0，重新绑定同一学号恢复为 1（不会重复累加）
+    icspService.unbindUserCredentials(user.id);
+    assert.equal(statsService.getOverview(user).registeredUsers, 0);
+    icspService.markMockBound(user.id);
+    assert.equal(statsService.getOverview(user).registeredUsers, 1);
 
     const cardRes = statsService.queryReservationCard('2023041101', user);
     assert.equal(cardRes.found, true);

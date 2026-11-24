@@ -321,7 +321,9 @@ export default function App() {
         open={bindOpen}
         onClose={() => setBindOpen(false)}
         user={user}
-        onUpdated={refreshAuth}
+        onUpdated={async () => {
+          await Promise.all([refreshAuth(), refreshOverview()]);
+        }}
       />
     </div>
   );

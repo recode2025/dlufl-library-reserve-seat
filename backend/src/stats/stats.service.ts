@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { DatabaseService, ReservationRow, UserRow } from '../database/database.service';
 import { hashVisitor } from '../common/crypto.util';
-import { LIBRARY_AREAS } from '../config/app.config';
+import { appConfig, LIBRARY_AREAS } from '../config/app.config';
 import { SchedulerService } from '../library/scheduler.service';
 
 @Injectable()
@@ -97,8 +97,20 @@ export class StatsService {
         .get() as { cnt: number }
     ).cnt;
 
+    // 仅统计当前有效绑定 ICSpace 的真实去重师生账号（解绑后实时扣减，重新绑定同一学号不重复累加）
+    const demoFilter = appConfig.mockMode ? '' : `AND cas_user_id NOT LIKE 'demo_%'`;
     const registeredUsers = (
-      this.dbService.db.prepare(`SELECT COUNT(*) as cnt FROM users`).get() as { cnt: number }
+      this.dbService.db
+        .prepare(
+          `SELECT COUNT(DISTINCT student_id) as cnt FROM users WHERE icspace_bound = 1 ${demoFilter}`,
+        )
+        .get() as { cnt: number }
+    ).cnt;
+
+    const totalCasUsers = (
+      this.dbService.db
+        .prepare(`SELECT COUNT(DISTINCT student_id) as cnt FROM users WHERE 1=1 ${demoFilter}`)
+        .get() as { cnt: number }
     ).cnt;
 
     const areaRows = this.dbService.db
@@ -152,6 +164,7 @@ export class StatsService {
       activePollingTasks,
       activeSchedules,
       registeredUsers,
+      totalCasUsers,
       countdown: this.schedulerService.getNextReleaseCountdown(now),
       areaDistribution,
       recentSuccesses,

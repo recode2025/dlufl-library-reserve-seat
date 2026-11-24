@@ -307,6 +307,14 @@ export class IcspService {
          WHERE id = ?`,
       )
       .run(now, userId);
+    // 解绑后同步暂停该用户的定时/轮询抢座任务，避免无凭证无效轮询
+    this.dbService.db
+      .prepare(
+        `UPDATE scheduled_tasks
+         SET enabled = 0, status = 'paused', last_message = '用户已解除 ICSpace 授权，任务自动暂停', updated_at = ?
+         WHERE user_id = ? AND (enabled = 1 OR status = 'polling')`,
+      )
+      .run(now, userId);
     this.sessionCache.delete(userId);
   }
 

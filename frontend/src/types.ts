@@ -147,6 +147,7 @@ export interface OverviewStats {
   activePollingTasks: number;
   activeSchedules: number;
   registeredUsers: number;
+  totalCasUsers?: number;
   countdown: ReleaseCountdown;
   areaDistribution: Array<{
     areaId: string;
