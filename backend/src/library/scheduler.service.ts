@@ -45,7 +45,8 @@ export class SchedulerService implements OnModuleInit {
     private readonly casService: CasService,
   ) {}
 
-  onModuleInit() {
+  async onModuleInit() {
+    await this.dbService.ensureReady();
     const pollingCount = (
       this.dbService.db
         .prepare(`SELECT COUNT(*) as cnt FROM scheduled_tasks WHERE status = 'polling' AND enabled = 1`)
@@ -394,6 +395,7 @@ export class SchedulerService implements OnModuleInit {
    */
   @Interval(1000)
   async tickScheduler() {
+    if (!this.dbService.db) return;
     await this.processScheduledTick(new Date());
   }
 

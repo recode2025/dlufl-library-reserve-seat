@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node ./dist/index.js",
-    "install:all": "npm --prefix backend install && npm --prefix frontend install",
+    "install:all": "npm --prefix backend install --include=dev && npm --prefix frontend install --include=dev",
     "build:all": "npm --prefix backend run build && npm --prefix frontend run build",
     "test:backend": "npm --prefix backend test",
     "pm2:start": "pm2 start ecosystem.config.cjs --env production",

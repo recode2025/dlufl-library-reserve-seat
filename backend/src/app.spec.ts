@@ -20,13 +20,11 @@ describe('DLUFL Library System Core Flows', () => {
   let statsService: StatsService;
   const origMockMode = appConfig.mockMode;
 
-  before(() => {
+  before(async () => {
     appConfig.mockMode = true;
     dbPath = path.join(os.tmpdir(), `dlufl-lib-test-${Date.now()}.db`);
     dbService = new DatabaseService();
-    dbService.onModuleDestroy();
-    (dbService as any).db = undefined;
-    dbService.init(dbPath);
+    await dbService.init(dbPath);
     casService = new CasService(dbService);
     icspService = new IcspService(dbService);
     schedulerService = new SchedulerService(dbService, icspService, casService);
@@ -215,6 +213,67 @@ describe('DLUFL Library System Core Flows', () => {
       assert.equal(cardRes.card?.pollingSuccess, 1);
     } finally {
       icspService.findBestSeatCandidate = origFind;
+    }
+  });
+
+  it('persists and queries cleanly using sql.js fallback engine (Node 18/20 compatible)', async () => {
+    const sqlJsPath = path.join(os.tmpdir(), `dlufl-sqljs-test-${Date.now()}.db`);
+    const fallbackDb = new DatabaseService();
+    try {
+      await fallbackDb.init(sqlJsPath, 'sql.js');
+      assert.equal(fallbackDb.engine, 'sql.js');
+
+      const cas = new CasService(fallbackDb);
+      const icsp = new IcspService(fallbackDb);
+      const sched = new SchedulerService(fallbackDb, icsp, cas);
+      const stats = new StatsService(fallbackDb, sched);
+
+      const u1 = cas.upsertUserFromCas({
+        user_id: 'u_sqljs_1',
+        id_number: '20240001',
+        user_name: '测试同学',
+        unit_name: '软件学院',
+        id_type: '1',
+      });
+      const u2 = cas.upsertUserFromCas({
+        user_id: 'u_sqljs_1',
+        id_number: '20240001',
+        user_name: '测试同学',
+        unit_name: '软件学院',
+        id_type: '1',
+      });
+      assert.equal(u1.id, u2.id);
+      assert.equal(u2.login_count, 2);
+
+      const v = stats.recordVisit('127.0.0.1', 'UA', '/');
+      assert.equal(v.totalVisits, 1);
+
+      const res = await icsp.reserveSeat(u2, {
+        areaId: '100475787',
+        devId: '100475787_001',
+        seatName: '2M-001',
+        targetDate: '2026-11-25',
+        startTime: '08:30',
+        endTime: '22:00',
+        source: 'manual',
+      });
+      assert.equal(res.success, true);
+
+      fallbackDb.onModuleDestroy();
+
+      // Reopen from disk to prove atomic persistence worked!
+      const reopened = new DatabaseService();
+      await reopened.init(sqlJsPath, 'sql.js');
+      const stats2 = new StatsService(reopened, new SchedulerService(reopened, new IcspService(reopened), new CasService(reopened)));
+      const ov = stats2.getOverview();
+      assert.equal(ov.totalVisits, 1);
+      assert.equal(ov.totalSuccessfulBookings, 1);
+      const card = stats2.queryReservationCard('20240001');
+      assert.equal(card.found, true);
+      assert.equal(card.card?.totalSuccess, 1);
+      reopened.onModuleDestroy();
+    } finally {
+      if (fs.existsSync(sqlJsPath)) fs.unlinkSync(sqlJsPath);
     }
   });
 });

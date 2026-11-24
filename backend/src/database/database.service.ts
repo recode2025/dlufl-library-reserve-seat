@@ -1,7 +1,7 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
-import { DatabaseSync } from 'node:sqlite';
+import initSqlJs, { type Database as SqlJsDatabase } from 'sql.js';
 import { appConfig } from '../config/app.config';
 
 export interface UserRow {
@@ -81,35 +81,177 @@ export interface TaskLogRow {
   created_at: string;
 }
 
+export interface StatementLike {
+  get(...params: any[]): any;
+  all(...params: any[]): any[];
+  run(...params: any[]): { lastInsertRowid: number; changes: number };
+}
+
+export interface DatabaseLike {
+  exec(sql: string): void;
+  prepare(sql: string): StatementLike;
+  close(): void;
+}
+
+/**
+ * 纯 WebAssembly (sql.js) 适配层：兼容 Node 18/20 等无内置 node:sqlite 的运行环境，
+ * 对外暴露与 node:sqlite 完全一致的同步 API，并在写操作后原子落盘。
+ */
+class SqlJsCompatDatabase implements DatabaseLike {
+  constructor(
+    private readonly raw: SqlJsDatabase,
+    private readonly dbPath: string,
+  ) {}
+
+  private persist() {
+    if (this.dbPath === ':memory:') return;
+    const dir = path.dirname(this.dbPath);
+    fs.mkdirSync(dir, { recursive: true });
+    const data = Buffer.from(this.raw.export());
+    const tmp = `${this.dbPath}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, this.dbPath);
+  }
+
+  private normalizeParams(params: any[]): any[] {
+    return params.map((p) => (p === undefined ? null : p));
+  }
+
+  exec(sql: string): void {
+    this.raw.exec(sql);
+    if (!/^\s*PRAGMA\s+/i.test(sql)) {
+      this.persist();
+    }
+  }
+
+  prepare(sql: string): StatementLike {
+    const raw = this.raw;
+    const persist = () => this.persist();
+    const normalize = (p: any[]) => this.normalizeParams(p);
+
+    return {
+      get(...params: any[]) {
+        const stmt = raw.prepare(sql);
+        try {
+          if (params.length > 0) stmt.bind(normalize(params));
+          if (!stmt.step()) return undefined;
+          return stmt.getAsObject();
+        } finally {
+          stmt.free();
+        }
+      },
+      all(...params: any[]) {
+        const stmt = raw.prepare(sql);
+        const rows: any[] = [];
+        try {
+          if (params.length > 0) stmt.bind(normalize(params));
+          while (stmt.step()) {
+            rows.push(stmt.getAsObject());
+          }
+          return rows;
+        } finally {
+          stmt.free();
+        }
+      },
+      run(...params: any[]) {
+        const stmt = raw.prepare(sql);
+        try {
+          if (params.length > 0) stmt.bind(normalize(params));
+          stmt.step();
+        } finally {
+          stmt.free();
+        }
+        const changes = raw.getRowsModified();
+        let lastInsertRowid = 0;
+        const idRes = raw.exec('SELECT last_insert_rowid() AS id');
+        if (idRes[0]?.values?.[0]?.[0] !== undefined) {
+          lastInsertRowid = Number(idRes[0].values[0][0]);
+        }
+        persist();
+        return { lastInsertRowid, changes };
+      },
+    };
+  }
+
+  close(): void {
+    this.persist();
+    this.raw.close();
+  }
+}
+
 @Injectable()
 export class DatabaseService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(DatabaseService.name);
-  public db!: DatabaseSync;
+  public db!: DatabaseLike;
+  public engine: 'node:sqlite' | 'sql.js' = 'node:sqlite';
+  private initPromise: Promise<void> | null = null;
 
-  constructor() {
-    this.init(appConfig.databasePath);
+  async onModuleInit() {
+    await this.ensureReady();
   }
 
-  init(dbPath: string) {
+  async ensureReady(): Promise<void> {
     if (this.db) return;
+    if (!this.initPromise) {
+      this.initPromise = this.init(appConfig.databasePath);
+    }
+    await this.initPromise;
+  }
+
+  async init(dbPath: string, forceEngine?: 'node:sqlite' | 'sql.js') {
+    if (this.db) return;
+
     if (dbPath !== ':memory:') {
       const dir = path.dirname(dbPath);
       fs.mkdirSync(dir, { recursive: true });
     }
-    this.db = new DatabaseSync(dbPath);
-    this.db.exec('PRAGMA journal_mode = WAL;');
-    this.db.exec('PRAGMA foreign_keys = ON;');
-    this.migrate();
-    this.logger.log(`SQLite initialized at ${dbPath}`);
-  }
 
-  onModuleInit() {
-    this.init(appConfig.databasePath);
+    if (forceEngine !== 'sql.js') {
+      try {
+        // 动态加载内置 node:sqlite（Node >= 22.5 支持）
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const nodeSqlite = require('node:sqlite');
+        const nativeDb = new nodeSqlite.DatabaseSync(dbPath) as DatabaseLike;
+        nativeDb.exec('PRAGMA journal_mode = WAL;');
+        nativeDb.exec('PRAGMA foreign_keys = ON;');
+        this.db = nativeDb;
+        this.engine = 'node:sqlite';
+        this.migrate();
+        this.logger.log(`SQLite initialized via node:sqlite at ${dbPath}`);
+        return;
+      } catch (err: any) {
+        if (forceEngine === 'node:sqlite') throw err;
+        this.logger.warn(
+          `Built-in node:sqlite unavailable (${err?.code || err?.message}), falling back to sql.js (Node 18/20 compatible)`,
+        );
+      }
+    }
+
+    const wasmDir = path.dirname(require.resolve('sql.js/dist/sql-wasm.wasm'));
+    const SQL = await initSqlJs({
+      locateFile: (file: string) => path.join(wasmDir, file),
+    });
+
+    let rawDb: SqlJsDatabase;
+    if (dbPath !== ':memory:' && fs.existsSync(dbPath)) {
+      const fileBuf = fs.readFileSync(dbPath);
+      rawDb = new SQL.Database(new Uint8Array(fileBuf));
+    } else {
+      rawDb = new SQL.Database();
+    }
+
+    rawDb.exec('PRAGMA foreign_keys = ON;');
+    this.db = new SqlJsCompatDatabase(rawDb, dbPath);
+    this.engine = 'sql.js';
+    this.migrate();
+    this.logger.log(`SQLite initialized via sql.js at ${dbPath}`);
   }
 
   onModuleDestroy() {
     if (this.db) {
       this.db.close();
+      (this as any).db = undefined;
+      this.initPromise = null;
     }
   }
 
@@ -247,13 +389,13 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     const row = this.db.prepare(`SELECT value FROM site_metrics WHERE key = ?`).get(key) as
       | { value: number }
       | undefined;
-    return row?.value ?? 0;
+    return Number(row?.value ?? 0);
   }
 
   getMetric(key: string): number {
     const row = this.db.prepare(`SELECT value FROM site_metrics WHERE key = ?`).get(key) as
       | { value: number }
       | undefined;
-    return row?.value ?? 0;
+    return Number(row?.value ?? 0);
   }
 }
