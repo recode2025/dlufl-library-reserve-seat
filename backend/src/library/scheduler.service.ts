@@ -57,39 +57,71 @@ export class SchedulerService implements OnModuleInit {
     }
   }
 
+  private getBeijingParts(date: Date) {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Shanghai',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      weekday: 'short',
+      hour12: false,
+    }).formatToParts(date);
+    const get = (t: string) => parts.find((p) => p.type === t)?.value || '00';
+    const weekdayMap: Record<string, number> = {
+      Sun: 0,
+      Mon: 1,
+      Tue: 2,
+      Wed: 3,
+      Thu: 4,
+      Fri: 5,
+      Sat: 6,
+    };
+    return {
+      year: Number(get('year')),
+      month: Number(get('month')),
+      day: Number(get('day')),
+      hour: Number(get('hour')),
+      minute: Number(get('minute')),
+      second: Number(get('second')),
+      weekday: weekdayMap[get('weekday')] ?? date.getDay(),
+    };
+  }
+
   formatDateLocal(date: Date): string {
-    const y = date.getFullYear();
-    const m = String(date.getMonth() + 1).padStart(2, '0');
-    const d = String(date.getDate()).padStart(2, '0');
-    return `${y}-${m}-${d}`;
+    const p = this.getBeijingParts(date);
+    return `${p.year}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')}`;
   }
 
   formatHHMM(date: Date): string {
-    return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+    const p = this.getBeijingParts(date);
+    return `${String(p.hour).padStart(2, '0')}:${String(p.minute).padStart(2, '0')}`;
   }
 
   computeTargetDate(baseDate: Date, offsetDays: number): string {
-    const d = new Date(baseDate.getTime());
-    d.setDate(d.getDate() + offsetDays);
+    const d = new Date(baseDate.getTime() + offsetDays * 24 * 60 * 60 * 1000);
     return this.formatDateLocal(d);
   }
 
   /**
-   * 计算距离下一次 18:00 放座与 18:01 自动开抢的倒计时信息。
+   * 统一按北京时间（Asia/Shanghai）计算距离下一次 18:00 放座与 18:01 自动开抢的倒计时信息。
    */
   getNextReleaseCountdown(now = new Date()) {
-    const release = new Date(now.getTime());
-    release.setHours(18, 0, 0, 0);
-    const grab = new Date(now.getTime());
-    grab.setHours(18, 1, 0, 0);
+    const p = this.getBeijingParts(now);
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const datePrefix = `${p.year}-${pad(p.month)}-${pad(p.day)}`;
+    let release = new Date(`${datePrefix}T18:00:00+08:00`);
+    let grab = new Date(`${datePrefix}T18:01:00+08:00`);
 
     let phase: 'before_release' | 'release_window' | 'after_grab' = 'before_release';
     if (now >= release && now < grab) {
       phase = 'release_window';
     } else if (now >= grab) {
       phase = 'after_grab';
-      release.setDate(release.getDate() + 1);
-      grab.setDate(grab.getDate() + 1);
+      release = new Date(release.getTime() + 24 * 60 * 60 * 1000);
+      grab = new Date(grab.getTime() + 24 * 60 * 60 * 1000);
     }
 
     return {
@@ -402,7 +434,7 @@ export class SchedulerService implements OnModuleInit {
   async processScheduledTick(now: Date) {
     const todayStr = this.formatDateLocal(now);
     const currentHHMM = this.formatHHMM(now);
-    const weekday = now.getDay();
+    const weekday = this.getBeijingParts(now).weekday;
 
     const enabledTasks = this.dbService.db
       .prepare(`SELECT * FROM scheduled_tasks WHERE enabled = 1`)

@@ -47,7 +47,8 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
   onJumpToScheduler,
 }) => {
   const [areaId, setAreaId] = useState(initialAreaId || areas[1]?.id || '100475787');
-  const [date, setDate] = useState(() => formatDateOffset(1));
+  // 18:00 后默认展示刚放出的明日批次；18:00 前默认展示今日已开放批次
+  const [date, setDate] = useState(() => formatDateOffset(new Date().getHours() >= 18 ? 1 : 0));
   const [startTime, setStartTime] = useState('08:30');
   const [endTime, setEndTime] = useState('22:00');
   const [filterStatus, setFilterStatus] = useState<'all' | 'free' | 'available'>('all');
@@ -102,7 +103,9 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
     const seats = data?.seats || [];
     return seats.filter((s) => {
       if (filterStatus === 'free' && s.status !== 'free') return false;
-      if (filterStatus === 'available' && s.status === 'occupied') return false;
+      if (filterStatus === 'available' && (s.status === 'occupied' || s.status === 'unreleased')) {
+        return false;
+      }
       if (seatKeyword.trim()) {
         const kw = seatKeyword.trim().toLowerCase();
         if (
@@ -306,6 +309,12 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
               <span className="h-3 w-3 rounded-sm border border-slate-200 bg-slate-100" />
               已占满（{data?.summary.occupied ?? 0}）
             </span>
+            {(data?.summary.unreleased ?? 0) > 0 && (
+              <span className="inline-flex items-center gap-1.5 font-medium text-[#0D386B]">
+                <span className="h-3 w-3 rounded-sm border border-dashed border-[#94A3B8] bg-[#EEF2F6]" />
+                未放座（{data?.summary.unreleased ?? 0}）
+              </span>
+            )}
           </div>
           <span className="font-mono text-[#64748B]">
             共 {data?.summary.total ?? 0} 席 · {data?.isLive ? '实时 ICSpace 数据' : '本地/未授权视图'}
@@ -375,7 +384,9 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
                     ? 'border-emerald-300 bg-emerald-50/70 text-emerald-900 hover:border-emerald-500'
                     : seat.status === 'partial'
                       ? 'border-amber-300 bg-amber-50/70 text-amber-900 hover:border-amber-500'
-                      : 'border-slate-200 bg-slate-100/80 text-slate-400 hover:border-slate-300';
+                      : seat.status === 'unreleased'
+                        ? 'border-dashed border-[#CBD5E1] bg-[#F1F5F9] text-[#64748B] hover:border-[#0D386B]/50'
+                        : 'border-slate-200 bg-slate-100/80 text-slate-400 hover:border-slate-300';
 
                 return (
                   <button
@@ -397,7 +408,9 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
                         ? '全空'
                         : seat.status === 'partial'
                           ? `${seat.freeRate}%`
-                          : '已满'}
+                          : seat.status === 'unreleased'
+                            ? '未放座'
+                            : '已满'}
                     </span>
                   </button>
                 );
@@ -428,14 +441,18 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
                         ? 'bg-emerald-100 text-emerald-800'
                         : selectedSeat.status === 'partial'
                           ? 'bg-amber-100 text-amber-800'
-                          : 'bg-slate-200 text-slate-600'
+                          : selectedSeat.status === 'unreleased'
+                            ? 'bg-slate-200 text-[#0D386B]'
+                            : 'bg-slate-200 text-slate-600'
                     }`}
                   >
                     {selectedSeat.status === 'free'
                       ? '全时段空闲'
                       : selectedSeat.status === 'partial'
                         ? `部分空闲 (${selectedSeat.freeRate}%)`
-                        : '该时段已约满'}
+                        : selectedSeat.status === 'unreleased'
+                          ? '该批次未放座'
+                          : '该时段已约满'}
                   </span>
                 </div>
 
@@ -448,7 +465,11 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
                     <span>20:00</span>
                     <span>22:00</span>
                   </div>
-                  <div className="relative h-3 w-full overflow-hidden rounded-full bg-emerald-200">
+                  <div
+                    className={`relative h-3 w-full overflow-hidden rounded-full ${
+                      selectedSeat.status === 'unreleased' ? 'bg-slate-200' : 'bg-emerald-200'
+                    }`}
+                  >
                     {selectedSeat.busySlots.map((slot, idx) => {
                       const dayStart = 8 * 60;
                       const daySpan = 14 * 60;
@@ -473,7 +494,12 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
               {/* Free Slots */}
               <div>
                 <p className="text-xs font-medium text-[#4D627A]">可用空闲时间段（点击填入）</p>
-                {selectedSeat.freeSlots.length === 0 ? (
+                {selectedSeat.status === 'unreleased' ? (
+                  <p className="mt-1.5 text-xs text-[#0D386B]">
+                    {data?.batchStatus?.message ||
+                      '该日期尚未到达 18:00 放座时间，暂不可直接预约；可点击下方按钮提前设为 18:01 自动抢座心仪座位。'}
+                  </p>
+                ) : selectedSeat.freeSlots.length === 0 ? (
                   <p className="mt-1.5 text-xs text-red-600">
                     当前查询时段内没有剩余空档，建议将该座加入「18:01 定时抢座 / 轮询捡漏」。
                   </p>
@@ -538,11 +564,19 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
               <button
                 type="button"
                 onClick={handleBook}
-                disabled={booking || selectedSeat.status === 'occupied'}
+                disabled={
+                  booking ||
+                  selectedSeat.status === 'occupied' ||
+                  selectedSeat.status === 'unreleased'
+                }
                 className="flex w-full items-center justify-center gap-2 rounded-lg bg-[#0D386B] px-4 py-2.5 text-sm font-semibold text-white hover:bg-[#0A2C55] disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <Sparkles className="h-4 w-4" />
-                {booking ? '正在提交预约...' : `确认预约 ${selectedSeat.devName}`}
+                {selectedSeat.status === 'unreleased'
+                  ? '该批次尚未放座（请使用下方 18:01 自动抢座）'
+                  : booking
+                    ? '正在提交预约...'
+                    : `确认预约 ${selectedSeat.devName}`}
               </button>
 
               <button

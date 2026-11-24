@@ -60,11 +60,18 @@ export interface SeatInfo {
   seatNumber: number;
   areaId: string;
   areaName: string;
-  status: 'free' | 'partial' | 'occupied';
+  status: 'free' | 'partial' | 'occupied' | 'unreleased';
   freeRate: number;
   longestFreeSlot: TimeSlot | null;
   freeSlots: TimeSlot[];
   busySlots: TimeSlot[];
+}
+
+export interface BatchReleaseStatus {
+  state: 'open' | 'unreleased' | 'expired' | 'closed';
+  bookable: boolean;
+  releaseAt?: string;
+  message: string;
 }
 
 export interface SeatsResponse {
@@ -73,12 +80,14 @@ export interface SeatsResponse {
   startTime: string;
   endTime: string;
   isLive: boolean;
+  batchStatus?: BatchReleaseStatus;
   notice?: string;
   summary: {
     total: number;
     free: number;
     partial: number;
     occupied: number;
+    unreleased: number;
   };
   seats: SeatInfo[];
 }

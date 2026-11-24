@@ -134,22 +134,37 @@ describe('DLUFL Library System Core Flows', () => {
     const visit2 = statsService.recordVisit('127.0.0.1', 'Mozilla/5.0', '/');
     assert.equal(visit2.totalVisits, visit1.totalVisits + 1);
 
+    const todayDate = schedulerService.formatDateLocal(new Date());
     const seatsRes = await icspService.fetchAreaSeats(
       user,
       '100475787',
-      '2026-11-25',
+      todayDate,
       '08:30',
       '22:00',
     );
     assert.ok(seatsRes.seats.length > 0);
+    assert.equal(seatsRes.batchStatus.state, 'open');
     const freeSeat = seatsRes.seats.find((s) => s.status === 'free');
     assert.ok(freeSeat, 'Expected at least one free seat in mock mode');
+
+    // 未放座批次（后天+）不应显示为全空，应明确标记为 unreleased
+    const futureDate = schedulerService.computeTargetDate(new Date(), 3);
+    const futureRes = await icspService.fetchAreaSeats(
+      user,
+      '100475787',
+      futureDate,
+      '08:30',
+      '22:00',
+    );
+    assert.equal(futureRes.batchStatus.state, 'unreleased');
+    assert.equal(futureRes.summary.free, 0);
+    assert.equal(futureRes.summary.unreleased, futureRes.seats.length);
 
     const bookRes = await icspService.reserveSeat(user, {
       areaId: freeSeat.areaId,
       devId: freeSeat.devId,
       seatName: freeSeat.devName,
-      targetDate: '2026-11-25',
+      targetDate: todayDate,
       startTime: '08:30',
       endTime: '22:00',
       source: 'manual',
@@ -204,8 +219,15 @@ describe('DLUFL Library System Core Flows', () => {
     };
 
     try {
-      // 模拟当天 18:01:00 触发
-      const triggerNow = new Date(2026, 10, 24, 18, 1, 0);
+      // 模拟当天 18:01:00 触发（先覆盖当日日期确保与当前时钟对齐）
+      const todayPrefix = schedulerService.formatDateLocal(new Date());
+      const triggerNow = new Date(`${todayPrefix}T18:01:00+08:00`);
+      const expectedTarget = schedulerService.computeTargetDate(triggerNow, 1);
+
+      // 让批次状态检查按 triggerNow(18:01) 判定次日批次已放座
+      const origBatchCheck = icspService.getBatchReleaseStatus.bind(icspService);
+      icspService.getBatchReleaseStatus = (d: string) => origBatchCheck(d, triggerNow);
+
       await schedulerService.processScheduledTick(triggerNow);
       // 等待异步首轮完成
       await new Promise((r) => setTimeout(r, 80));
@@ -213,10 +235,10 @@ describe('DLUFL Library System Core Flows', () => {
       const afterFirst = schedulerService.listUserTasks(user.id).find((t) => t.id === task.id)!;
       assert.equal(afterFirst.status, 'polling');
       assert.equal(afterFirst.pollAttempts, 1);
-      assert.equal(afterFirst.activeTargetDate, '2026-11-25');
+      assert.equal(afterFirst.activeTargetDate, expectedTarget);
 
-      // 模拟 3 秒后轮询下一拍 -> 发现空位并成功约上
-      const pollNow = new Date(2026, 10, 24, 18, 1, 4);
+      // 模拟 4 秒后轮询下一拍 -> 发现空位并成功约上
+      const pollNow = new Date(triggerNow.getTime() + 4000);
       // 确保 last_run_at 距今超过 poll_interval_sec
       dbService.db
         .prepare(`UPDATE scheduled_tasks SET last_run_at = ? WHERE id = ?`)
@@ -224,6 +246,8 @@ describe('DLUFL Library System Core Flows', () => {
 
       await schedulerService.processScheduledTick(pollNow);
       await new Promise((r) => setTimeout(r, 80));
+
+      icspService.getBatchReleaseStatus = origBatchCheck;
 
       const afterSecond = schedulerService.listUserTasks(user.id).find((t) => t.id === task.id)!;
       assert.equal(afterSecond.status, 'succeeded');

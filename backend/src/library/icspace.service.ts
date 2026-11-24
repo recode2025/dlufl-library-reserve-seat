@@ -22,11 +22,18 @@ export interface SeatInfo {
   seatNumber: number;
   areaId: string;
   areaName: string;
-  status: 'free' | 'partial' | 'occupied';
+  status: 'free' | 'partial' | 'occupied' | 'unreleased';
   freeRate: number;
   longestFreeSlot: TimeSlot | null;
   freeSlots: TimeSlot[];
   busySlots: TimeSlot[];
+}
+
+export interface BatchReleaseStatus {
+  state: 'open' | 'unreleased' | 'expired' | 'closed';
+  bookable: boolean;
+  releaseAt?: string;
+  message: string;
 }
 
 export interface CachedIcspaceSession {
@@ -477,6 +484,83 @@ export class IcspService {
     return seats;
   }
 
+  /**
+   * 统一按北京时间 (Asia/Shanghai) 计算图书馆放座批次状态：
+   * 规则：每天 18:00 开放次日座位。
+   * - targetDate < 今日：已过期
+   * - targetDate === 今日：已放座（22:00 后提示已闭馆）
+   * - targetDate === 明日：今日 18:00 前为 unreleased（未放座），18:00 及之后为 open
+   * - targetDate > 明日：unreleased（未放座，将于目标日期前一天 18:00 开放）
+   */
+  getBatchReleaseStatus(targetDate: string, now = new Date()): BatchReleaseStatus {
+    const bjParts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Shanghai',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).formatToParts(now);
+
+    const get = (type: string) => bjParts.find((p) => p.type === type)?.value || '00';
+    const todayStr = `${get('year')}-${get('month')}-${get('day')}`;
+    const currentMin = Number(get('hour')) * 60 + Number(get('minute'));
+
+    const todayUtc = Date.UTC(Number(get('year')), Number(get('month')) - 1, Number(get('day')));
+    const [ty, tm, td] = targetDate.split('-').map(Number);
+    const targetUtc = Date.UTC(ty, tm - 1, td);
+    const diffDays = Math.round((targetUtc - todayUtc) / (24 * 60 * 60 * 1000));
+
+    if (diffDays < 0) {
+      return {
+        state: 'expired',
+        bookable: false,
+        message: `${targetDate} 批次已过期，无法预约历史日期座位。`,
+      };
+    }
+
+    if (diffDays === 0) {
+      if (currentMin >= 22 * 60) {
+        return {
+          state: 'closed',
+          bookable: false,
+          message: `今日（${todayStr}）图书馆已到 22:00 闭馆时间，请切换至明日批次。`,
+        };
+      }
+      return {
+        state: 'open',
+        bookable: true,
+        message: `今日（${todayStr}）批次已开放预约。`,
+      };
+    }
+
+    if (diffDays === 1) {
+      if (currentMin < 18 * 60) {
+        return {
+          state: 'unreleased',
+          bookable: false,
+          releaseAt: `${todayStr} 18:00`,
+          message: `明日（${targetDate}）座位批次尚未放座，将于今日 18:00 开放；可先点击心仪座位提前设置 18:01 自动抢座。`,
+        };
+      }
+      return {
+        state: 'open',
+        bookable: true,
+        message: `明日（${targetDate}）批次已于今日 18:00 放座，当前可直接预约。`,
+      };
+    }
+
+    const prevDay = new Date(targetUtc - 24 * 60 * 60 * 1000);
+    const releaseDate = `${prevDay.getUTCFullYear()}-${String(prevDay.getUTCMonth() + 1).padStart(2, '0')}-${String(prevDay.getUTCDate()).padStart(2, '0')}`;
+    return {
+      state: 'unreleased',
+      bookable: false,
+      releaseAt: `${releaseDate} 18:00`,
+      message: `${targetDate} 座位批次尚未放座，预计于 ${releaseDate} 18:00 开放；可先选中心仪座号配置定期预约。`,
+    };
+  }
+
   async fetchAreaSeats(
     user: UserRow | undefined,
     areaId: string,
@@ -489,8 +573,9 @@ export class IcspService {
     startTime: string;
     endTime: string;
     isLive: boolean;
+    batchStatus: BatchReleaseStatus;
     notice?: string;
-    summary: { total: number; free: number; partial: number; occupied: number };
+    summary: { total: number; free: number; partial: number; occupied: number; unreleased: number };
     seats: SeatInfo[];
   }> {
     const area = this.getAreaById(areaId);
@@ -498,15 +583,30 @@ export class IcspService {
       throw new BadRequestException(`未知的图书馆区域 ID: ${areaId}`);
     }
 
+    const batchStatus = this.getBatchReleaseStatus(targetDate);
+
     if (appConfig.mockMode) {
-      const seats = this.generateMockSeats(area, targetDate, startTime, endTime);
+      const seats = this.generateMockSeats(area, targetDate, startTime, endTime).map((s) =>
+        batchStatus.bookable
+          ? s
+          : {
+              ...s,
+              status: 'unreleased' as const,
+              freeRate: 0,
+              longestFreeSlot: null,
+              freeSlots: [],
+            },
+      );
       return {
         area,
         targetDate,
         startTime,
         endTime,
         isLive: false,
-        notice: '当前处于演练模式（ICSPACE_MOCK_MODE=true），座位状态由本地模拟器与真实预约库联合生成。',
+        batchStatus,
+        notice: batchStatus.bookable
+          ? '当前处于演练模式（ICSPACE_MOCK_MODE=true），座位状态由本地模拟器与真实预约库联合生成。'
+          : batchStatus.message,
         summary: this.summarizeSeats(seats),
         seats,
       };
@@ -519,8 +619,9 @@ export class IcspService {
         startTime,
         endTime,
         isLive: false,
+        batchStatus,
         notice: '请先登录并完成「图书馆预约凭证授权」，即可实时加载大外 ICSpace 座位占用数据。',
-        summary: { total: 0, free: 0, partial: 0, occupied: 0 },
+        summary: { total: 0, free: 0, partial: 0, occupied: 0, unreleased: 0 },
         seats: [],
       };
     }
@@ -554,6 +655,29 @@ export class IcspService {
     const seats: SeatInfo[] = (rawList || []).map((device: any, idx: number) => {
       const devName = String(device.devName || `${area.name}-${idx + 1}`);
       const seatNumber = this.extractSeatNumber(devName, idx);
+
+      // 批次尚未到 18:00 放座时间，或 ICSpace 明确返回未开放时段（openList 为空 / openStart 为空）
+      const explicitClosedByRemote =
+        (Array.isArray(device.openList) && device.openList.length === 0) ||
+        device.openStart === '' ||
+        device.openStart === null ||
+        device.resvStatus === 0;
+
+      if (!batchStatus.bookable || explicitClosedByRemote) {
+        return {
+          devId: String(device.devId),
+          devName,
+          seatNumber,
+          areaId: area.id,
+          areaName: area.name,
+          status: 'unreleased' as const,
+          freeRate: 0,
+          longestFreeSlot: null,
+          freeSlots: [],
+          busySlots: [],
+        };
+      }
+
       const { busySlots, freeSlots, longestFreeSlot, freeRate } =
         this.computeSeatIntervals(device.resvInfo || [], startMin, endMin);
 
@@ -577,12 +701,23 @@ export class IcspService {
 
     seats.sort((a, b) => a.seatNumber - b.seatNumber);
 
+    const effectiveBatchStatus: BatchReleaseStatus =
+      batchStatus.bookable && seats.length > 0 && seats.every((s) => s.status === 'unreleased')
+        ? {
+            state: 'unreleased',
+            bookable: false,
+            message: `${targetDate} 该区域当前未开放预约时段（ICSpace 返回无开放窗口）。`,
+          }
+        : batchStatus;
+
     return {
       area,
       targetDate,
       startTime,
       endTime,
       isLive: true,
+      batchStatus: effectiveBatchStatus,
+      notice: effectiveBatchStatus.bookable ? undefined : effectiveBatchStatus.message,
       summary: this.summarizeSeats(seats),
       seats,
     };
@@ -592,12 +727,14 @@ export class IcspService {
     let free = 0;
     let partial = 0;
     let occupied = 0;
+    let unreleased = 0;
     for (const s of seats) {
       if (s.status === 'free') free++;
       else if (s.status === 'partial') partial++;
+      else if (s.status === 'unreleased') unreleased++;
       else occupied++;
     }
-    return { total: seats.length, free, partial, occupied };
+    return { total: seats.length, free, partial, occupied, unreleased };
   }
 
   async reserveSeat(
