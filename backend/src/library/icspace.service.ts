@@ -2006,6 +2006,7 @@ export class IcspService {
       startTime: string;
       endTime: string;
       preferredSeats: number[];
+      excludedSeats?: number[];
       seatMin: number;
       seatMax: number;
       minFreeRate: number;
@@ -2020,6 +2021,11 @@ export class IcspService {
     if (!calibrated.hasValidWindow) return null;
     const startMin = calibrated.effectiveStartMin;
     const endMin = calibrated.effectiveEndMin;
+    const excludedSet = new Set(
+      (options.excludedSeats || [])
+        .map((n) => Number(n))
+        .filter((n) => Number.isInteger(n) && n > 0),
+    );
 
     for (const areaId of options.areaIds) {
       try {
@@ -2033,6 +2039,7 @@ export class IcspService {
         if (!res.seats.length) continue;
 
         const isEligible = (seat: SeatInfo): TimeSlot | null => {
+          if (excludedSet.has(seat.seatNumber)) return null;
           const slot = seat.longestFreeSlot;
           if (!slot || slot.durationMin < 30) return null;
           if (seat.freeRate < options.minFreeRate) return null;
@@ -2042,9 +2049,10 @@ export class IcspService {
           return slot;
         };
 
-        // 1. 优先匹配心仪座位号
+        // 1. 优先匹配心仪座位号（自动跳过黑名单座位）
         if (options.preferredSeats.length > 0) {
           for (const prefNum of options.preferredSeats) {
+            if (excludedSet.has(prefNum)) continue;
             const seat = res.seats.find((s) => s.seatNumber === prefNum);
             if (!seat) continue;
             const slot = isEligible(seat);
@@ -2052,9 +2060,10 @@ export class IcspService {
           }
         }
 
-        // 2. 在座位号范围内选择最长空闲时间段
+        // 2. 在座位号范围内选择最长空闲时间段（自动跳过黑名单座位）
         let best: { seat: SeatInfo; slot: TimeSlot } | null = null;
         for (const seat of res.seats) {
+          if (excludedSet.has(seat.seatNumber)) continue;
           if (seat.seatNumber < options.seatMin || seat.seatNumber > options.seatMax) {
             continue;
           }

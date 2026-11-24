@@ -303,6 +303,36 @@ describe('DLUFL Library System Core Flows', () => {
     assert.equal(futureRes.summary.free, 0);
     assert.equal(futureRes.summary.unreleased, futureRes.seats.length);
 
+    // 验证轮询找座黑名单：把当前找到的最优座位加入 excludedSeats 后，寻座引擎必须跳过它
+    const firstCandidate = await icspService.findBestSeatCandidate(user, {
+      areaIds: ['100475787'],
+      targetDate: todayDate,
+      startTime: '08:30',
+      endTime: '22:00',
+      preferredSeats: [freeSeat.seatNumber],
+      excludedSeats: [],
+      seatMin: 1,
+      seatMax: 200,
+      minFreeRate: 50,
+      forceFullRange: false,
+    });
+    assert.equal(firstCandidate?.seat.seatNumber, freeSeat.seatNumber);
+
+    const afterExclude = await icspService.findBestSeatCandidate(user, {
+      areaIds: ['100475787'],
+      targetDate: todayDate,
+      startTime: '08:30',
+      endTime: '22:00',
+      preferredSeats: [freeSeat.seatNumber],
+      excludedSeats: [freeSeat.seatNumber],
+      seatMin: 1,
+      seatMax: 200,
+      minFreeRate: 50,
+      forceFullRange: false,
+    });
+    assert.ok(afterExclude, 'Expected fallback seat when first preferred seat is blacklisted');
+    assert.notEqual(afterExclude?.seat.seatNumber, freeSeat.seatNumber);
+
     const bookRes = await icspService.reserveSeat(user, {
       areaId: freeSeat.areaId,
       devId: freeSeat.devId,
@@ -318,6 +348,7 @@ describe('DLUFL Library System Core Flows', () => {
     assert.ok(overview.totalSuccessfulBookings >= 1);
     assert.ok(overview.totalVisits >= 2);
     assert.equal(overview.registeredUsers, 1);
+    assert.equal(overview.recentSuccesses[0]?.studentName, '林*辰');
 
     // 验证解绑后统计立即扣减为 0，重新绑定同一学号恢复为 1（不会重复累加）
     icspService.unbindUserCredentials(user.id);
@@ -425,6 +456,31 @@ describe('DLUFL Library System Core Flows', () => {
       assert.equal(cardRes.found, true);
       assert.equal(cardRes.card?.totalSuccess, 1);
       assert.equal(cardRes.card?.pollingSuccess, 1);
+
+      // 验证手动触发/选座页「服务端轮询找座」即使第 1 次就成功也记为 polling，不会误记为 18:01 准点抢座
+      const pollTask = schedulerService.createTask(user, {
+        name: '[实时盯座] 二楼东区',
+        areaIds: ['100475785'],
+        preferredSeats: [],
+        excludedSeats: [],
+        seatMin: 1,
+        seatMax: 96,
+        startTime: '08:30',
+        endTime: '22:00',
+        minFreeRate: 20,
+        triggerTime: '18:01',
+        targetDayOffset: 0,
+        weekdays: [0, 1, 2, 3, 4, 5, 6],
+        isRecurring: false,
+        pollIntervalSec: 5,
+        maxPollMinutes: 0,
+      });
+      icspService.findBestSeatCandidate = origFind;
+      const triggered = await schedulerService.triggerTaskNow(user, pollTask.id, todayPrefix);
+      assert.equal(triggered.status, 'succeeded');
+      const cardAfterPoll = statsService.queryReservationCard('2023041102', user);
+      assert.equal(cardAfterPoll.card?.scheduledSuccess, 0);
+      assert.equal(cardAfterPoll.card?.pollingSuccess, 2);
     } finally {
       icspService.findBestSeatCandidate = origFind;
     }

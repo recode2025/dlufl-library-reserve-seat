@@ -50,6 +50,7 @@ export interface ScheduledTaskRow {
   enabled: number;
   area_ids_json: string;
   preferred_seats_json: string;
+  excluded_seats_json: string;
   seat_min: number;
   seat_max: number;
   start_time: string;
@@ -318,6 +319,7 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
         enabled INTEGER NOT NULL DEFAULT 1,
         area_ids_json TEXT NOT NULL,
         preferred_seats_json TEXT NOT NULL DEFAULT '[]',
+        excluded_seats_json TEXT NOT NULL DEFAULT '[]',
         seat_min INTEGER NOT NULL DEFAULT 1,
         seat_max INTEGER NOT NULL DEFAULT 200,
         start_time TEXT NOT NULL DEFAULT '08:30',
@@ -376,6 +378,16 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     const userColumns = this.db.prepare(`PRAGMA table_info(users)`).all() as Array<{ name: string }>;
     if (!userColumns.some((col) => col.name === 'encrypted_cas_tgc')) {
       this.db.exec(`ALTER TABLE users ADD COLUMN encrypted_cas_tgc TEXT;`);
+    }
+
+    // 兼容存量数据库：自动补齐 scheduled_tasks.excluded_seats_json 列（轮询找座黑名单）
+    const taskColumns = this.db
+      .prepare(`PRAGMA table_info(scheduled_tasks)`)
+      .all() as Array<{ name: string }>;
+    if (!taskColumns.some((col) => col.name === 'excluded_seats_json')) {
+      this.db.exec(
+        `ALTER TABLE scheduled_tasks ADD COLUMN excluded_seats_json TEXT NOT NULL DEFAULT '[]';`,
+      );
     }
 
     const now = new Date().toISOString();

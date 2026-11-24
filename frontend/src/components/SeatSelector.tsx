@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
+  Ban,
   CalendarClock,
   CheckCircle2,
   Clock,
@@ -115,9 +116,40 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
   const [pollIntervalSec, setPollIntervalSec] = useState(10);
   const [pollAllowPartial, setPollAllowPartial] = useState(true);
   const [pollLockSeat, setPollLockSeat] = useState(false);
+  const [pollBlacklistText, setPollBlacklistText] = useState('');
   const [serverTasks, setServerTasks] = useState<ScheduledTask[]>([]);
   const [serverActionBusy, setServerActionBusy] = useState(false);
   const prevPollingIdsRef = useRef<Set<number>>(new Set());
+
+  const pollExcludedSeats = useMemo(
+    () =>
+      Array.from(
+        new Set(
+          pollBlacklistText
+            .split(/[,，\s]+/)
+            .map((s) => parseInt(s, 10))
+            .filter((n) => !Number.isNaN(n) && n > 0),
+        ),
+      ),
+    [pollBlacklistText],
+  );
+
+  const toggleSeatBlacklist = useCallback((seatNumber: number) => {
+    setPollBlacklistText((prev) => {
+      const nums = Array.from(
+        new Set(
+          prev
+            .split(/[,，\s]+/)
+            .map((s) => parseInt(s, 10))
+            .filter((n) => !Number.isNaN(n) && n > 0),
+        ),
+      );
+      const next = nums.includes(seatNumber)
+        ? nums.filter((n) => n !== seatNumber)
+        : [...nums, seatNumber].sort((a, b) => a - b);
+      return next.join(', ');
+    });
+  }, []);
 
   useEffect(() => {
     if (initialAreaId) setAreaId(initialAreaId);
@@ -367,6 +399,7 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
         name: taskName,
         areaIds: [areaId],
         preferredSeats: pollLockSeat && selectedSeat ? [selectedSeat.seatNumber] : [],
+        excludedSeats: pollLockSeat ? [] : pollExcludedSeats,
         seatMin: pollLockSeat && selectedSeat ? selectedSeat.seatNumber : 1,
         seatMax: pollLockSeat && selectedSeat ? selectedSeat.seatNumber : 500,
         startTime,
@@ -463,7 +496,7 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
   return (
     <div className="space-y-5">
       {/* Area Switcher Bar */}
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <div className="grid grid-cols-2 gap-2.5 sm:gap-3 lg:grid-cols-4">
         {areas.map((area) => {
           const active = area.id === areaId;
           return (
@@ -474,16 +507,16 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
                 setAreaId(area.id);
                 setFeedback(null);
               }}
-              className={`rounded-xl border px-4 py-3.5 text-left transition-colors ${
+              className={`min-w-0 rounded-xl border px-3 py-3 text-left transition-colors sm:px-4 sm:py-3.5 ${
                 active
                   ? 'border-[#0D386B] bg-[#0D386B] text-white'
                   : 'border-[#DCE4EE] bg-white text-[#0D223D] hover:border-[#0D386B]/50'
               }`}
             >
-              <div className="flex items-center justify-between">
-                <span className="text-sm font-semibold">{area.name}</span>
+              <div className="flex items-center justify-between gap-1.5">
+                <span className="truncate text-sm font-semibold">{area.name}</span>
                 <span
-                  className={`rounded px-1.5 py-0.5 font-mono text-[11px] ${
+                  className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] sm:text-[11px] ${
                     active ? 'bg-white/15 text-blue-100' : 'bg-[#F3F6FA] text-[#4D627A]'
                   }`}
                 >
@@ -491,7 +524,7 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
                 </span>
               </div>
               <p
-                className={`mt-1 truncate text-xs ${
+                className={`mt-1 truncate text-[11px] sm:text-xs ${
                   active ? 'text-blue-100/85' : 'text-[#64748B]'
                 }`}
               >
@@ -503,13 +536,13 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
       </div>
 
       {/* Filters & Time Controls */}
-      <div className="rounded-xl border border-[#DCE4EE] bg-white p-4">
-        <div className="flex flex-wrap items-center gap-3">
-          <div className="flex items-center gap-1.5">
+      <div className="rounded-xl border border-[#DCE4EE] bg-white p-3.5 sm:p-4">
+        <div className="flex flex-wrap items-center gap-2.5 sm:gap-3">
+          <div className="flex w-full flex-wrap items-center gap-1.5 sm:w-auto">
             <button
               type="button"
               onClick={() => setDate(todayStr)}
-              className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${
+              className={`rounded-lg px-2.5 py-1.5 text-xs font-semibold sm:px-3 ${
                 date === todayStr
                   ? 'bg-[#0D386B] text-white'
                   : 'border border-[#DCE4EE] bg-[#F8FAFC] text-[#4D627A] hover:text-[#0D223D]'
@@ -520,7 +553,7 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
             <button
               type="button"
               onClick={() => setDate(tomorrowStr)}
-              className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${
+              className={`rounded-lg px-2.5 py-1.5 text-xs font-semibold sm:px-3 ${
                 date === tomorrowStr
                   ? 'bg-[#0D386B] text-white'
                   : 'border border-[#DCE4EE] bg-[#F8FAFC] text-[#4D627A] hover:text-[#0D223D]'
@@ -532,23 +565,23 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
               type="date"
               value={date}
               onChange={(e) => setDate(e.target.value)}
-              className="rounded-lg border border-[#CBD5E1] px-2.5 py-1.5 font-mono text-xs text-[#0D223D]"
+              className="h-8 min-w-0 flex-1 rounded-lg border border-[#CBD5E1] bg-white px-2.5 py-1 font-mono text-xs text-[#0D223D] sm:flex-none"
             />
           </div>
 
-          <div className="flex items-center gap-1.5">
+          <div className="flex w-full items-center gap-1.5 sm:w-auto">
             <input
               type="time"
               value={startTime}
               onChange={(e) => setStartTime(e.target.value)}
-              className="rounded-lg border border-[#CBD5E1] px-2.5 py-1.5 font-mono text-xs text-[#0D223D]"
+              className="h-8 min-w-0 flex-1 rounded-lg border border-[#CBD5E1] bg-white px-2.5 py-1 font-mono text-xs text-[#0D223D] sm:w-24 sm:flex-none"
             />
-            <span className="text-xs text-[#64748B]">至</span>
+            <span className="shrink-0 text-xs text-[#64748B]">至</span>
             <input
               type="time"
               value={endTime}
               onChange={(e) => setEndTime(e.target.value)}
-              className="rounded-lg border border-[#CBD5E1] px-2.5 py-1.5 font-mono text-xs text-[#0D223D]"
+              className="h-8 min-w-0 flex-1 rounded-lg border border-[#CBD5E1] bg-white px-2.5 py-1 font-mono text-xs text-[#0D223D] sm:w-24 sm:flex-none"
             />
           </div>
 
@@ -568,7 +601,7 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
             ))}
           </div>
 
-          <div className="ml-auto flex flex-wrap items-center gap-2">
+          <div className="flex w-full flex-wrap items-center gap-2 sm:ml-auto sm:w-auto">
             <div className="relative">
               <Search className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-[#64748B]" />
               <input
@@ -699,15 +732,19 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
               </div>
               <p className="mt-0.5 text-xs text-[#4D627A]">
                 {activeServerTask
-                  ? `${activeServerTask.name}（目标 ${activeServerTask.activeTargetDate || date}）：${activeServerTask.lastMessage || '服务器正在持续扫描空位...'}`
+                  ? `${activeServerTask.name}（目标 ${activeServerTask.activeTargetDate || date}${
+                      activeServerTask.excludedSeats?.length
+                        ? ` · 排除黑名单 ${activeServerTask.excludedSeats.join(', ')}`
+                        : ''
+                    }）：${activeServerTask.lastMessage || '服务器正在持续扫描空位...'}`
                   : '由后端 NestJS 调度引擎持续执行查座、时间校准与自动提交预约（不依赖浏览器在线），直到成功约上座位。'}
               </p>
             </div>
           </div>
 
-          <div className="flex flex-wrap items-center gap-3 text-xs">
-            <div className="flex items-center gap-2 rounded-lg border border-[#DCE4EE] bg-white px-2.5 py-1.5">
-              <span className="text-[#4D627A]">轮询间隔</span>
+          <div className="flex w-full flex-wrap items-center gap-2.5 text-xs sm:w-auto sm:gap-3">
+            <div className="flex w-full items-center justify-between gap-2 rounded-lg border border-[#DCE4EE] bg-white px-2.5 py-1.5 sm:w-auto">
+              <span className="shrink-0 text-[#4D627A]">轮询间隔</span>
               <input
                 type="range"
                 min={5}
@@ -716,10 +753,10 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
                 value={pollIntervalSec}
                 onChange={(e) => setPollIntervalSec(Number(e.target.value))}
                 disabled={Boolean(activeServerTask) || serverActionBusy}
-                className="w-24 accent-[#0D386B] disabled:opacity-60"
+                className="min-w-0 flex-1 accent-[#0D386B] disabled:opacity-60 sm:w-24 sm:flex-none"
                 aria-label="服务器端轮询间隔（5到60秒）"
               />
-              <span className="w-8 text-right font-mono font-semibold text-[#0D386B]">
+              <span className="w-8 shrink-0 text-right font-mono font-semibold text-[#0D386B]">
                 {pollIntervalSec}s
               </span>
             </div>
@@ -734,6 +771,21 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
               />
               含部分时段可约
             </label>
+
+            {!pollLockSeat && (
+              <div className="flex w-full items-center gap-1.5 rounded-lg border border-[#DCE4EE] bg-white px-2.5 py-1.5 sm:w-auto">
+                <Ban className="h-3.5 w-3.5 shrink-0 text-rose-500" />
+                <span className="shrink-0 text-[#4D627A]">黑名单</span>
+                <input
+                  type="text"
+                  value={pollBlacklistText}
+                  onChange={(e) => setPollBlacklistText(e.target.value)}
+                  disabled={Boolean(activeServerTask) || serverActionBusy}
+                  placeholder="排除座号如 1,5,18"
+                  className="min-w-0 flex-1 bg-transparent font-mono text-xs text-[#0D223D] outline-none placeholder:text-[#94A3B8] disabled:opacity-60 sm:w-32 sm:flex-none"
+                />
+              </div>
+            )}
 
             {selectedSeat && (
               <label className="inline-flex cursor-pointer items-center gap-1.5 text-[#0D223D]">
@@ -752,7 +804,7 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
               type="button"
               onClick={handleToggleServerPolling}
               disabled={serverActionBusy}
-              className={`inline-flex items-center gap-1.5 rounded-lg px-3.5 py-2 text-xs font-semibold text-white disabled:opacity-60 ${
+              className={`inline-flex w-full items-center justify-center gap-1.5 rounded-lg px-3.5 py-2 text-xs font-semibold text-white disabled:opacity-60 sm:w-auto ${
                 activeServerTask
                   ? 'bg-[#B45309] hover:bg-[#92400E]'
                   : 'bg-[#0D386B] hover:bg-[#0A2C55]'
@@ -1317,12 +1369,15 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
                     )}
                   </div>
 
-                  {/* Booking Time Inputs */}
+                  {/* Booking Time Inputs (移动端防错位：等高单行标签 + min-w-0 + 统一 h-10 + 防 iOS 自动缩放) */}
                   <div>
-                    <div className="grid grid-cols-2 gap-2.5">
-                      <div>
-                        <label className="mb-1 block text-xs font-medium text-[#4D627A]">
-                          预约开始（最早 {bookableStartStr || openStartStr}）
+                    <div className="grid grid-cols-2 items-end gap-2.5">
+                      <div className="flex min-w-0 flex-col">
+                        <label className="mb-1 flex items-center justify-between gap-1 text-xs font-medium text-[#4D627A]">
+                          <span className="shrink-0">预约开始</span>
+                          <span className="truncate font-mono text-[10px] text-[#64748B]">
+                            ≥{bookableStartStr || openStartStr}
+                          </span>
                         </label>
                         <input
                           type="time"
@@ -1330,12 +1385,15 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
                           max={openEndStr}
                           value={bookStart}
                           onChange={(e) => setBookStart(e.target.value)}
-                          className="w-full rounded-lg border border-[#CBD5E1] px-3 py-2 font-mono text-sm"
+                          className="h-10 w-full min-w-0 max-w-full rounded-lg border border-[#CBD5E1] bg-white px-2.5 py-2 font-mono text-base text-[#0D223D] outline-none focus:border-[#0D386B] sm:px-3 sm:text-sm"
                         />
                       </div>
-                      <div>
-                        <label className="mb-1 block text-xs font-medium text-[#4D627A]">
-                          预约结束（最晚 {suggestedMaxEndStr || bookableEndStr || openEndStr}）
+                      <div className="flex min-w-0 flex-col">
+                        <label className="mb-1 flex items-center justify-between gap-1 text-xs font-medium text-[#4D627A]">
+                          <span className="shrink-0">预约结束</span>
+                          <span className="truncate font-mono text-[10px] text-[#64748B]">
+                            ≤{suggestedMaxEndStr || bookableEndStr || openEndStr}
+                          </span>
                         </label>
                         <input
                           type="time"
@@ -1343,7 +1401,7 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
                           max={suggestedMaxEndStr || openEndStr}
                           value={bookEnd}
                           onChange={(e) => setBookEnd(e.target.value)}
-                          className="w-full rounded-lg border border-[#CBD5E1] px-3 py-2 font-mono text-sm"
+                          className="h-10 w-full min-w-0 max-w-full rounded-lg border border-[#CBD5E1] bg-white px-2.5 py-2 font-mono text-base text-[#0D223D] outline-none focus:border-[#0D386B] sm:px-3 sm:text-sm"
                         />
                       </div>
                     </div>
@@ -1397,6 +1455,22 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
                       : booking
                         ? '正在提交预约...'
                         : `确认预约 ${activeSeat.devName}`}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => toggleSeatBlacklist(activeSeat.seatNumber)}
+                    disabled={Boolean(activeServerTask)}
+                    className={`flex w-full items-center justify-center gap-2 rounded-lg border px-4 py-2 text-xs font-semibold transition-colors disabled:opacity-50 ${
+                      pollExcludedSeats.includes(activeSeat.seatNumber)
+                        ? 'border-rose-300 bg-rose-50 text-rose-700 hover:bg-rose-100'
+                        : 'border-[#DCE4EE] bg-white text-[#4D627A] hover:border-rose-300 hover:text-rose-700'
+                    }`}
+                  >
+                    <Ban className="h-3.5 w-3.5" />
+                    {pollExcludedSeats.includes(activeSeat.seatNumber)
+                      ? `已在轮询黑名单中（点击移出 ${activeSeat.devName}）`
+                      : `将 ${activeSeat.devName} 加入轮询找座黑名单`}
                   </button>
 
                   <button

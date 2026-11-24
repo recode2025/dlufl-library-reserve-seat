@@ -52,6 +52,7 @@ export const SchedulerPanel: React.FC<SchedulerPanelProps> = ({
   const [name, setName] = useState('每日 18:01 自动抢次日座');
   const [selectedAreas, setSelectedAreas] = useState<string[]>(['100475787', '100475785']);
   const [preferredSeatsText, setPreferredSeatsText] = useState('');
+  const [excludedSeatsText, setExcludedSeatsText] = useState('');
   const [seatMin, setSeatMin] = useState(1);
   const [seatMax, setSeatMax] = useState(120);
   const [startTime, setStartTime] = useState('08:30');
@@ -140,11 +141,16 @@ export const SchedulerPanel: React.FC<SchedulerPanelProps> = ({
         .split(/[,，\s]+/)
         .map((s) => parseInt(s, 10))
         .filter((n) => !Number.isNaN(n) && n > 0);
+      const excludedSeats = excludedSeatsText
+        .split(/[,，\s]+/)
+        .map((s) => parseInt(s, 10))
+        .filter((n) => !Number.isNaN(n) && n > 0);
 
       await api.library.createSchedule({
         name,
         areaIds: selectedAreas,
         preferredSeats,
+        excludedSeats,
         seatMin,
         seatMax,
         startTime,
@@ -326,23 +332,27 @@ export const SchedulerPanel: React.FC<SchedulerPanelProps> = ({
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="mb-1 block text-xs font-medium text-[#4D627A]">开抢时间（每天）</label>
+          <div className="grid grid-cols-2 items-end gap-2.5 sm:gap-3">
+            <div className="min-w-0">
+              <label className="mb-1 block truncate text-xs font-medium text-[#4D627A]">
+                开抢时间（每天）
+              </label>
               <input
                 type="time"
                 value={triggerTime}
                 onChange={(e) => setTriggerTime(e.target.value)}
-                className="w-full rounded-lg border border-[#CBD5E1] px-3 py-2 font-mono text-sm"
+                className="h-10 w-full min-w-0 max-w-full rounded-lg border border-[#CBD5E1] bg-white px-2.5 py-2 font-mono text-base text-[#0D223D] sm:px-3 sm:text-sm"
                 required
               />
             </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-[#4D627A]">预约目标日期</label>
+            <div className="min-w-0">
+              <label className="mb-1 block truncate text-xs font-medium text-[#4D627A]">
+                预约目标日期
+              </label>
               <select
                 value={targetDayOffset}
                 onChange={(e) => setTargetDayOffset(Number(e.target.value) as 0 | 1)}
-                className="w-full rounded-lg border border-[#CBD5E1] bg-white px-3 py-2 text-sm"
+                className="h-10 w-full min-w-0 rounded-lg border border-[#CBD5E1] bg-white px-2.5 py-2 text-xs text-[#0D223D] sm:px-3 sm:text-sm"
               >
                 <option value={1}>次日座位（18:00 放次日）</option>
                 <option value={0}>当日剩余空座</option>
@@ -350,23 +360,27 @@ export const SchedulerPanel: React.FC<SchedulerPanelProps> = ({
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="mb-1 block text-xs font-medium text-[#4D627A]">座位开始时段</label>
+          <div className="grid grid-cols-2 items-end gap-2.5 sm:gap-3">
+            <div className="min-w-0">
+              <label className="mb-1 block truncate text-xs font-medium text-[#4D627A]">
+                座位开始时段
+              </label>
               <input
                 type="time"
                 value={startTime}
                 onChange={(e) => setStartTime(e.target.value)}
-                className="w-full rounded-lg border border-[#CBD5E1] px-3 py-2 font-mono text-sm"
+                className="h-10 w-full min-w-0 max-w-full rounded-lg border border-[#CBD5E1] bg-white px-2.5 py-2 font-mono text-base text-[#0D223D] sm:px-3 sm:text-sm"
               />
             </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-[#4D627A]">座位结束时段</label>
+            <div className="min-w-0">
+              <label className="mb-1 block truncate text-xs font-medium text-[#4D627A]">
+                座位结束时段
+              </label>
               <input
                 type="time"
                 value={endTime}
                 onChange={(e) => setEndTime(e.target.value)}
-                className="w-full rounded-lg border border-[#CBD5E1] px-3 py-2 font-mono text-sm"
+                className="h-10 w-full min-w-0 max-w-full rounded-lg border border-[#CBD5E1] bg-white px-2.5 py-2 font-mono text-base text-[#0D223D] sm:px-3 sm:text-sm"
               />
             </div>
           </div>
@@ -380,6 +394,19 @@ export const SchedulerPanel: React.FC<SchedulerPanelProps> = ({
               value={preferredSeatsText}
               onChange={(e) => setPreferredSeatsText(e.target.value)}
               placeholder="留空则在座位号范围内自动择优"
+              className="w-full rounded-lg border border-[#CBD5E1] px-3 py-2 font-mono text-sm"
+            />
+          </div>
+
+          <div>
+            <label className="mb-1 block text-xs font-medium text-[#4D627A]">
+              轮询黑名单座位号（选填，排除不想要的座号，如 1, 2, 19）
+            </label>
+            <input
+              type="text"
+              value={excludedSeatsText}
+              onChange={(e) => setExcludedSeatsText(e.target.value)}
+              placeholder="命中这些座号时自动跳过，不会预约"
               className="w-full rounded-lg border border-[#CBD5E1] px-3 py-2 font-mono text-sm"
             />
           </div>
@@ -432,7 +459,7 @@ export const SchedulerPanel: React.FC<SchedulerPanelProps> = ({
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-3 rounded-lg border border-[#DCE4EE] bg-[#F8FAFC] p-3">
+          <div className="grid grid-cols-1 gap-3 rounded-lg border border-[#DCE4EE] bg-[#F8FAFC] p-3 sm:grid-cols-2">
             <div>
               <label className="mb-1 flex items-center justify-between text-xs font-medium text-[#4D627A]">
                 <span>无座轮询间隔</span>
@@ -600,6 +627,16 @@ export const SchedulerPanel: React.FC<SchedulerPanelProps> = ({
                             {task.preferredSeats.join(', ')}
                           </span>{' '}
                           （无座回退 {task.seatMin}–{task.seatMax} 号）
+                        </p>
+                      )}
+
+                      {task.excludedSeats && task.excludedSeats.length > 0 && (
+                        <p className="mt-1 text-xs text-rose-700">
+                          黑名单排除：
+                          <span className="font-mono font-semibold">
+                            {task.excludedSeats.join(', ')}
+                          </span>{' '}
+                          号座
                         </p>
                       )}
                     </div>

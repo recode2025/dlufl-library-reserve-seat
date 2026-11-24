@@ -146,6 +146,7 @@ export interface ScheduledTask {
   areaIds: string[];
   areas: Array<{ id: string; name: string }>;
   preferredSeats: number[];
+  excludedSeats: number[];
   seatMin: number;
   seatMax: number;
   startTime: string;

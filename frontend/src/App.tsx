@@ -167,7 +167,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => setBindOpen(true)}
-                  className={`hidden items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium sm:inline-flex ${
+                  className={`inline-flex items-center gap-1 rounded-lg border px-2 py-1.5 text-[11px] font-medium sm:gap-1.5 sm:px-2.5 sm:text-xs ${
                     user.icspaceBound
                       ? 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
                       : 'border-amber-200 bg-amber-50 text-amber-800 hover:bg-amber-100'
@@ -175,21 +175,23 @@ export default function App() {
                 >
                   {user.icspaceBound ? (
                     <>
-                      <ShieldCheck className="h-3.5 w-3.5" />
-                      ICSpace 已授权
+                      <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
+                      <span className="hidden sm:inline">ICSpace 已授权</span>
+                      <span className="sm:hidden">已授权</span>
                     </>
                   ) : (
                     <>
-                      <KeyRound className="h-3.5 w-3.5" />
-                      授权抢座凭证
+                      <KeyRound className="h-3.5 w-3.5 shrink-0" />
+                      <span className="hidden sm:inline">授权抢座凭证</span>
+                      <span className="sm:hidden">去授权</span>
                     </>
                   )}
                 </button>
 
-                <div className="flex items-center gap-2 rounded-lg border border-[#DCE4EE] bg-[#F8FAFC] px-3 py-1.5">
-                  <div className="text-right">
-                    <div className="text-xs font-semibold text-[#0D223D]">{user.name}</div>
-                    <div className="font-mono text-[10px] text-[#64748B]">
+                <div className="flex items-center gap-1.5 rounded-lg border border-[#DCE4EE] bg-[#F8FAFC] px-2 py-1 sm:gap-2 sm:px-3 sm:py-1.5">
+                  <div className="max-w-[92px] text-right sm:max-w-none">
+                    <div className="truncate text-xs font-semibold text-[#0D223D]">{user.name}</div>
+                    <div className="hidden font-mono text-[10px] text-[#64748B] sm:block">
                       {user.studentId} · 第{user.loginCount}次登录
                     </div>
                   </div>
@@ -197,7 +199,7 @@ export default function App() {
                     type="button"
                     onClick={handleLogout}
                     title="退出登录（同步注销 CAS）"
-                    className="rounded-md p-1.5 text-[#4D627A] hover:bg-red-50 hover:text-red-600"
+                    className="rounded-md p-1 text-[#4D627A] hover:bg-red-50 hover:text-red-600 sm:p-1.5"
                   >
                     <LogOut className="h-4 w-4" />
                   </button>

@@ -24,6 +24,7 @@ export interface CreateScheduleDto {
   name: string;
   areaIds: string[];
   preferredSeats?: number[];
+  excludedSeats?: number[];
   seatMin?: number;
   seatMax?: number;
   startTime: string;
@@ -177,6 +178,7 @@ export class SchedulerService implements OnModuleInit {
       areaIds,
       areas,
       preferredSeats: JSON.parse(row.preferred_seats_json || '[]') as number[],
+      excludedSeats: JSON.parse(row.excluded_seats_json || '[]') as number[],
       seatMin: row.seat_min,
       seatMax: row.seat_max,
       startTime: row.start_time,
@@ -256,9 +258,20 @@ export class SchedulerService implements OnModuleInit {
       Array.isArray(dto.weekdays) && dto.weekdays.length > 0
         ? dto.weekdays
         : [0, 1, 2, 3, 4, 5, 6];
-    const preferredSeats = (dto.preferredSeats || [])
-      .map((n) => Number(n))
-      .filter((n) => !Number.isNaN(n) && n > 0);
+    const preferredSeats = Array.from(
+      new Set(
+        (dto.preferredSeats || [])
+          .map((n) => Number(n))
+          .filter((n) => Number.isInteger(n) && n > 0),
+      ),
+    );
+    const excludedSeats = Array.from(
+      new Set(
+        (dto.excludedSeats || [])
+          .map((n) => Number(n))
+          .filter((n) => Number.isInteger(n) && n > 0),
+      ),
+    );
 
     const enabled = dto.enabled !== false ? 1 : 0;
     const pollIntervalSec = this.clampPollInterval(dto.pollIntervalSec);
@@ -267,11 +280,11 @@ export class SchedulerService implements OnModuleInit {
     const res = this.dbService.db
       .prepare(
         `INSERT INTO scheduled_tasks (
-           user_id, name, enabled, area_ids_json, preferred_seats_json,
+           user_id, name, enabled, area_ids_json, preferred_seats_json, excluded_seats_json,
            seat_min, seat_max, start_time, end_time, min_free_rate, force_full_range,
            trigger_time, target_day_offset, weekdays_json, is_recurring,
            poll_interval_sec, max_poll_minutes, status, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         user.id,
@@ -279,6 +292,7 @@ export class SchedulerService implements OnModuleInit {
         enabled,
         JSON.stringify(dto.areaIds),
         JSON.stringify(preferredSeats),
+        JSON.stringify(excludedSeats),
         Math.max(1, Number(dto.seatMin || 1)),
         Math.max(1, Number(dto.seatMax || 200)),
         startTime,
@@ -297,10 +311,12 @@ export class SchedulerService implements OnModuleInit {
       );
 
     const taskId = Number(res.lastInsertRowid);
+    const blacklistNote =
+      excludedSeats.length > 0 ? `，已排除黑名单座号 [${excludedSeats.join(', ')}]` : '';
     this.appendLog(
       taskId,
       'info',
-      `已创建定时抢座任务：每天 ${triggerTime} 开抢${dto.targetDayOffset === 0 ? '当日' : '次日'} ${startTime}-${endTime} 座位，无座时每 ${pollIntervalSec} 秒自动轮询直到约上。`,
+      `已创建定时抢座任务：每天 ${triggerTime} 开抢${dto.targetDayOffset === 0 ? '当日' : '次日'} ${startTime}-${endTime} 座位，无座时每 ${pollIntervalSec} 秒自动轮询直到约上${blacklistNote}。`,
     );
 
     const row = this.dbService.db
@@ -325,10 +341,23 @@ export class SchedulerService implements OnModuleInit {
           ? 'idle'
           : existing.status;
 
+    const nextExcludedJson =
+      patch.excludedSeats !== undefined
+        ? JSON.stringify(
+            Array.from(
+              new Set(
+                patch.excludedSeats
+                  .map((n) => Number(n))
+                  .filter((n) => Number.isInteger(n) && n > 0),
+              ),
+            ),
+          )
+        : existing.excluded_seats_json || '[]';
+
     this.dbService.db
       .prepare(
         `UPDATE scheduled_tasks
-         SET name = ?, enabled = ?, area_ids_json = ?, preferred_seats_json = ?,
+         SET name = ?, enabled = ?, area_ids_json = ?, preferred_seats_json = ?, excluded_seats_json = ?,
              seat_min = ?, seat_max = ?, start_time = ?, end_time = ?,
              min_free_rate = ?, force_full_range = ?, trigger_time = ?,
              target_day_offset = ?, weekdays_json = ?, is_recurring = ?,
@@ -342,6 +371,7 @@ export class SchedulerService implements OnModuleInit {
         patch.preferredSeats !== undefined
           ? JSON.stringify(patch.preferredSeats)
           : existing.preferred_seats_json,
+        nextExcludedJson,
         patch.seatMin !== undefined ? Number(patch.seatMin) : existing.seat_min,
         patch.seatMax !== undefined ? Number(patch.seatMax) : existing.seat_max,
         patch.startTime ?? existing.start_time,
@@ -412,7 +442,8 @@ export class SchedulerService implements OnModuleInit {
     const freshTask = this.dbService.db
       .prepare(`SELECT * FROM scheduled_tasks WHERE id = ?`)
       .get(taskId) as unknown as ScheduledTaskRow;
-    await this.executePollingAttempt(freshTask, true);
+    // 手动触发/页面发起的实时轮询不属于 18:01 定时准点触发，一律记为 polling
+    await this.executePollingAttempt(freshTask, false);
 
     const latest = this.dbService.db
       .prepare(`SELECT * FROM scheduled_tasks WHERE id = ?`)
@@ -553,6 +584,7 @@ export class SchedulerService implements OnModuleInit {
 
       const areaIds = JSON.parse(task.area_ids_json || '[]') as string[];
       const preferredSeats = JSON.parse(task.preferred_seats_json || '[]') as number[];
+      const excludedSeats = JSON.parse(task.excluded_seats_json || '[]') as number[];
 
       const candidate = await this.icspService.findBestSeatCandidate(user, {
         areaIds,
@@ -560,6 +592,7 @@ export class SchedulerService implements OnModuleInit {
         startTime: task.start_time,
         endTime: task.end_time,
         preferredSeats,
+        excludedSeats,
         seatMin: task.seat_min,
         seatMax: task.seat_max,
         minFreeRate: task.min_free_rate,
@@ -582,6 +615,9 @@ export class SchedulerService implements OnModuleInit {
         return;
       }
 
+      const isScheduledSource =
+        isFirstBurst && attemptNum === 1 && !task.name.startsWith('[实时盯座]');
+
       const reserveRes = await this.icspService.reserveSeat(user, {
         areaId: candidate.seat.areaId,
         devId: candidate.seat.devId,
@@ -589,7 +625,7 @@ export class SchedulerService implements OnModuleInit {
         targetDate,
         startTime: candidate.slot.startStr,
         endTime: candidate.slot.endStr,
-        source: isFirstBurst && attemptNum === 1 ? 'scheduled' : 'polling',
+        source: isScheduledSource ? 'scheduled' : 'polling',
         scheduleId: task.id,
       });
 

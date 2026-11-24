@@ -9,11 +9,29 @@
   html {
     font-family: var(--font-sans);
     scroll-behavior: smooth;
+    overflow-x: clip;
+    -webkit-tap-highlight-color: transparent;
   }
 
   body {
     background-color: #f3f6fa;
     color: #0d223d;
+    overflow-x: clip;
+  }
+
+  /* 修复 iOS Safari / 移动端浏览器下 type="time" 和 type="date" 默认固有宽度导致两列错位、溢出问题 */
+  input[type="time"],
+  input[type="date"] {
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+    -webkit-appearance: none;
+    appearance: none;
+  }
+
+  input[type="time"]::-webkit-date-and-time-value,
+  input[type="date"]::-webkit-date-and-time-value {
+    text-align: left;
   }
 }
 

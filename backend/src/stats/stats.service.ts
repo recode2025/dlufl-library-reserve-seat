@@ -12,10 +12,12 @@ export class StatsService {
   ) {}
 
   private maskName(name: string): string {
-    if (!name) return '***';
-    if (name.length <= 1) return name;
-    if (name.length === 2) return `${name[0]}*`;
-    return `${name[0]}${'*'.repeat(name.length - 2)}${name[name.length - 1]}`;
+    const trimmed = (name || '').trim();
+    if (!trimmed) return '*';
+    if (trimmed.length === 1) return '*';
+    if (trimmed.length === 2) return `${trimmed[0]}*`;
+    const maskIdx = Math.floor(trimmed.length / 2);
+    return `${trimmed.slice(0, maskIdx)}*${trimmed.slice(maskIdx + 1)}`;
   }
 
   private computeCardTier(totalSuccess: number): { code: string; label: string; nextTarget: number } {
@@ -140,21 +142,18 @@ export class StatsService {
       )
       .all() as unknown as ReservationRow[];
 
-    const recentSuccesses = recentRows.map((r) => {
-      const isSelf = currentUser && currentUser.student_id === r.student_id;
-      return {
-        id: r.id,
-        studentName: isSelf ? r.student_name : this.maskName(r.student_name),
-        unitName: r.unit_name,
-        areaName: r.area_name,
-        seatName: r.seat_name,
-        targetDate: r.target_date,
-        startTime: r.start_time,
-        endTime: r.end_time,
-        source: r.source,
-        createdAt: r.created_at,
-      };
-    });
+    const recentSuccesses = recentRows.map((r) => ({
+      id: r.id,
+      studentName: this.maskName(r.student_name),
+      unitName: r.unit_name,
+      areaName: r.area_name,
+      seatName: r.seat_name,
+      targetDate: r.target_date,
+      startTime: r.start_time,
+      endTime: r.end_time,
+      source: r.source,
+      createdAt: r.created_at,
+    }));
 
     return {
       totalSuccessfulBookings,
