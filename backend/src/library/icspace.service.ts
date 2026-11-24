@@ -612,44 +612,89 @@ export class IcspService {
       };
     }
 
-    if (!user || !user.icspace_bound) {
-      return {
-        area,
-        targetDate,
-        startTime,
-        endTime,
-        isLive: false,
-        batchStatus,
-        notice: '请先登录并完成「图书馆预约凭证授权」，即可实时加载大外 ICSpace 座位占用数据。',
-        summary: { total: 0, free: 0, partial: 0, occupied: 0, unreleased: 0 },
-        seats: [],
-      };
-    }
-
     const startMin = this.timeToMinutes(startTime);
     const endMin = this.timeToMinutes(endTime);
     const compactDate = targetDate.replace(/-/g, '');
     const apiUrl = `${appConfig.icspace.host}/ic-web/reserve?roomIds=${area.id}&resvDates=${compactDate}&sysKind=8&_=${Date.now()}`;
 
     let rawList: any[] | null = null;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const session = await this.ensureUserSession(user, attempt > 0);
-      const client = this.createClientFromCookies(session.cookies);
-      const response = await client.get(apiUrl);
-      if (response.data?.code === 0 && Array.isArray(response.data?.data)) {
-        rawList = response.data.data;
-        break;
+    let isGuestPreview = false;
+
+    if (!user || !user.icspace_bound) {
+      isGuestPreview = true;
+      // 1) 未登录/未绑定时，先尝试公开接口直拉 ICSpace 座位状态
+      try {
+        const pubResp = await axios.get(apiUrl, {
+          headers: this.buildHeaders(),
+          timeout: 10000,
+        });
+        if (pubResp.data?.code === 0 && Array.isArray(pubResp.data?.data)) {
+          rawList = pubResp.data.data;
+        }
+      } catch {
+        // ignore anonymous error and try cached public reader session
       }
-      // 认证过期自动刷新重登一次
-      if (attempt === 0) {
-        this.logger.warn(
-          `ICSpace seats fetch returned code=${response.data?.code} (${response.data?.message}), refreshing session...`,
+
+      // 2) 若 ICSpace 要求登录态，则复用任意一个已授权只读会话拉取公共房间座位占用（不暴露任何个人信息）
+      if (!rawList) {
+        const readerUser = this.dbService.db
+          .prepare(
+            `SELECT * FROM users WHERE icspace_bound = 1 AND encrypted_cas_password IS NOT NULL ORDER BY updated_at DESC LIMIT 1`,
+          )
+          .get() as UserRow | undefined;
+
+        if (readerUser) {
+          for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+              const session = await this.ensureUserSession(readerUser, attempt > 0);
+              const client = this.createClientFromCookies(session.cookies);
+              const response = await client.get(apiUrl);
+              if (response.data?.code === 0 && Array.isArray(response.data?.data)) {
+                rawList = response.data.data;
+                break;
+              }
+            } catch {
+              // continue retry
+            }
+          }
+        }
+      }
+
+      if (!rawList) {
+        return {
+          area,
+          targetDate,
+          startTime,
+          endTime,
+          isLive: false,
+          batchStatus,
+          notice: !user
+            ? '当前暂未获取到公共实时座位数据，请先通过 CAS 登录后授权 ICSpace 即可实时查座与预约。'
+            : '请先完成「图书馆预约凭证授权」，即可实时加载大外 ICSpace 座位占用数据。',
+          summary: { total: 0, free: 0, partial: 0, occupied: 0, unreleased: 0 },
+          seats: [],
+        };
+      }
+    } else {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const session = await this.ensureUserSession(user, attempt > 0);
+        const client = this.createClientFromCookies(session.cookies);
+        const response = await client.get(apiUrl);
+        if (response.data?.code === 0 && Array.isArray(response.data?.data)) {
+          rawList = response.data.data;
+          break;
+        }
+        // 认证过期自动刷新重登一次
+        if (attempt === 0) {
+          this.logger.warn(
+            `ICSpace seats fetch returned code=${response.data?.code} (${response.data?.message}), refreshing session...`,
+          );
+          continue;
+        }
+        throw new BadRequestException(
+          `获取图书馆座位失败: ${response.data?.message || 'ICSpace 接口异常'}`,
         );
-        continue;
       }
-      throw new BadRequestException(
-        `获取图书馆座位失败: ${response.data?.message || 'ICSpace 接口异常'}`,
-      );
     }
 
     const seats: SeatInfo[] = (rawList || []).map((device: any, idx: number) => {
@@ -710,6 +755,15 @@ export class IcspService {
           }
         : batchStatus;
 
+    let finalNotice: string | undefined;
+    if (!effectiveBatchStatus.bookable) {
+      finalNotice = effectiveBatchStatus.message;
+    } else if (isGuestPreview) {
+      finalNotice = !user
+        ? '当前为未登录实时查座模式，支持 AJAX 自动刷新；登录后即可一键预约或配置 18:01 自动抢座。'
+        : '当前为只读预览模式；完成「授权图书馆 ICSpace」后即可一键预约或开启 18:01 自动抢座。';
+    }
+
     return {
       area,
       targetDate,
@@ -717,7 +771,7 @@ export class IcspService {
       endTime,
       isLive: true,
       batchStatus: effectiveBatchStatus,
-      notice: effectiveBatchStatus.bookable ? undefined : effectiveBatchStatus.message,
+      notice: finalNotice,
       summary: this.summarizeSeats(seats),
       seats,
     };

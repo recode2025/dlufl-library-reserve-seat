@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   CalendarClock,
@@ -55,8 +55,11 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
   const [seatKeyword, setSeatKeyword] = useState('');
 
   const [data, setData] = useState<SeatsResponse | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [lastUpdated, setLastUpdated] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
+  const reqSeqRef = useRef(0);
 
   const [selectedSeat, setSelectedSeat] = useState<SeatInfo | null>(null);
   const [bookStart, setBookStart] = useState('08:30');
@@ -69,25 +72,47 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
   }, [initialAreaId]);
 
   const loadSeats = useCallback(async () => {
-    setLoading(true);
+    const seq = ++reqSeqRef.current;
+    setRefreshing(true);
     setError(null);
     try {
       const res = await api.library.seats({ areaId, date, startTime, endTime });
+      if (seq !== reqSeqRef.current) return;
       setData(res);
+      setLastUpdated(
+        new Date().toLocaleTimeString('zh-CN', {
+          hour12: false,
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        }),
+      );
       setSelectedSeat((prev) => {
         if (!prev) return res.seats.find((s) => s.status !== 'occupied') || res.seats[0] || null;
         return res.seats.find((s) => s.devId === prev.devId) || res.seats[0] || null;
       });
     } catch (err: any) {
+      if (seq !== reqSeqRef.current) return;
       setError(err?.message || '加载座位状态失败');
     } finally {
-      setLoading(false);
+      if (seq === reqSeqRef.current) {
+        setRefreshing(false);
+      }
     }
   }, [areaId, date, startTime, endTime]);
 
   useEffect(() => {
     void loadSeats();
   }, [loadSeats]);
+
+  // 静默 AJAX 定时刷新（未登录与已登录均支持，原地更新数据，无阴影/骨架闪烁）
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const timer = window.setInterval(() => {
+      void loadSeats();
+    }, 15000);
+    return () => window.clearInterval(timer);
+  }, [autoRefresh, loadSeats]);
 
   useEffect(() => {
     if (selectedSeat?.longestFreeSlot) {
@@ -282,13 +307,23 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
               <option value="free">仅全时段空闲</option>
             </select>
 
+            <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-[#DCE4EE] bg-[#F8FAFC] px-2.5 py-1.5 text-xs text-[#4D627A]">
+              <input
+                type="checkbox"
+                checked={autoRefresh}
+                onChange={(e) => setAutoRefresh(e.target.checked)}
+                className="accent-[#0D386B]"
+              />
+              自动刷新
+            </label>
+
             <button
               type="button"
               onClick={() => void loadSeats()}
-              disabled={loading}
+              disabled={refreshing}
               className="inline-flex items-center gap-1.5 rounded-lg border border-[#DCE4EE] bg-[#F8FAFC] px-3 py-1.5 text-xs font-medium text-[#0D223D] hover:bg-[#E7EEF7]"
             >
-              <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
+              <RefreshCw className={`h-3.5 w-3.5 ${refreshing ? 'animate-spin' : ''}`} />
               刷新
             </button>
           </div>
@@ -362,18 +397,20 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
             <h3 className="text-sm font-semibold text-[#0D223D]">
               {data?.area.name || '阅览区'} 座位分布图
             </h3>
-            <span className="text-xs text-[#64748B]">点击座位查看空闲时段并立即预约</span>
+            <span className="font-mono text-xs text-[#64748B]">
+              {refreshing
+                ? '正在同步最新座位...'
+                : lastUpdated
+                  ? `上次同步 ${lastUpdated}`
+                  : '点击座位查看空闲时段'}
+            </span>
           </div>
 
-          {loading ? (
-            <div className="grid grid-cols-4 gap-2.5 sm:grid-cols-6 md:grid-cols-8">
-              {Array.from({ length: 32 }).map((_, i) => (
-                <div key={i} className="h-14 animate-pulse rounded-lg bg-[#EEF2F6]" />
-              ))}
-            </div>
-          ) : filteredSeats.length === 0 ? (
+          {filteredSeats.length === 0 ? (
             <div className="rounded-xl border border-dashed border-[#CBD5E1] bg-[#F8FAFC] py-14 text-center text-sm text-[#4D627A]">
-              当前筛选条件下没有可显示的座位。
+              {refreshing && !data
+                ? '正在获取该区域座位列表...'
+                : '当前筛选条件下没有可显示的座位。'}
             </div>
           ) : (
             <div className="grid grid-cols-4 gap-2 sm:grid-cols-6 md:grid-cols-8">
