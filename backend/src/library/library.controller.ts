@@ -76,6 +76,25 @@ export class LibraryController {
     );
   }
 
+  @UseGuards(OptionalAuthGuard)
+  @Get('seats/:devId/detail')
+  async getSeatDetail(
+    @Req() req: AuthenticatedRequest,
+    @Param('devId') devId: string,
+    @Query('areaId') areaId?: string,
+    @Query('date') date?: string,
+  ) {
+    const targetAreaId = areaId || this.icspService.getAreas()[1].id;
+    const today = this.schedulerService.formatDateLocal(new Date());
+    const targetDate = date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : today;
+    return await this.icspService.fetchSeatDetail(
+      req.user,
+      targetAreaId,
+      devId,
+      targetDate,
+    );
+  }
+
   @UseGuards(AuthGuard)
   @Post('reserve')
   async reserveSeat(

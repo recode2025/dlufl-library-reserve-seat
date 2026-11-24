@@ -39,7 +39,7 @@ export default function App() {
   const [authError, setAuthError] = useState<string | null>(null);
 
   const [loginOpen, setLoginOpen] = useState(false);
-  const [intranetInitial, setIntranetInitial] = useState(false);
+  const [intranetInitial, setIntranetInitial] = useState(true);
   const [bindOpen, setBindOpen] = useState(false);
 
   const visitRecordedRef = useRef(false);
@@ -207,7 +207,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => {
-                  setIntranetInitial(false);
+                  setIntranetInitial(true);
                   setLoginOpen(true);
                 }}
                 className="inline-flex items-center gap-1.5 rounded-lg bg-[#0D386B] px-4 py-2 text-sm font-semibold text-white hover:bg-[#0A2C55]"

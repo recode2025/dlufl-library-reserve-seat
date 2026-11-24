@@ -7,6 +7,8 @@ export interface UserProfile {
   idType: string;
   email: string;
   icspaceBound: boolean;
+  hasTgc?: boolean;
+  hasAutoRenew?: boolean;
   loginCount: number;
   lastLoginAt: string;
   createdAt: string;
@@ -54,6 +56,13 @@ export interface TimeSlot {
   durationMin: number;
 }
 
+export interface SeatRuleInfo {
+  minResvTime: number;
+  maxResvTime: number;
+  earliestResvTime: number;
+  latestResvTime: number;
+}
+
 export interface SeatInfo {
   devId: string;
   devName: string;
@@ -67,6 +76,29 @@ export interface SeatInfo {
   longestFreeSlot: TimeSlot | null;
   freeSlots: TimeSlot[];
   busySlots: TimeSlot[];
+  openStart?: string;
+  openEnd?: string;
+  openWindows?: TimeSlot[];
+  bookableStart?: string | null;
+  bookableEnd?: string | null;
+  rule?: SeatRuleInfo;
+}
+
+export interface SeatDetailResponse {
+  seat: SeatInfo;
+  targetDate: string;
+  isLive: boolean;
+  source: 'device_api' | 'room_api' | 'mock';
+  bookable: boolean;
+  reason?: string;
+  releaseAt?: string;
+  openStart: string;
+  openEnd: string;
+  openWindows: TimeSlot[];
+  bookableStart: string | null;
+  bookableEnd: string | null;
+  rule: SeatRuleInfo;
+  fetchedAt: string;
 }
 
 export interface BatchReleaseStatus {

@@ -8,6 +8,7 @@ import type {
   OverviewStats,
   ReleaseCountdown,
   ScheduledTask,
+  SeatDetailResponse,
   SeatsResponse,
   TaskLog,
 } from './types';
@@ -60,8 +61,16 @@ export const api = {
       username: string;
       password: string;
       execution: string;
+      rememberForSchedule?: boolean;
     }) =>
-      request<{ success: boolean; ticket: string; redirectUrl: string }>('/api/auth/cas/submit', {
+      request<{
+        success: boolean;
+        authenticated?: boolean;
+        ticket: string;
+        redirectUrl: string;
+        icspaceAutoBound?: boolean;
+        icspaceNotice?: string | null;
+      }>('/api/auth/cas/submit', {
         method: 'POST',
         body: JSON.stringify(payload),
       }),
@@ -91,6 +100,12 @@ export const api = {
     seats: (params: { areaId: string; date: string; startTime: string; endTime: string }) => {
       const qs = new URLSearchParams(params).toString();
       return request<SeatsResponse>(`/api/library/seats?${qs}`);
+    },
+    seatDetail: (params: { devId: string; areaId: string; date: string }) => {
+      const qs = new URLSearchParams({ areaId: params.areaId, date: params.date }).toString();
+      return request<SeatDetailResponse>(
+        `/api/library/seats/${encodeURIComponent(params.devId)}/detail?${qs}`,
+      );
     },
     reserve: (payload: {
       areaId: string;

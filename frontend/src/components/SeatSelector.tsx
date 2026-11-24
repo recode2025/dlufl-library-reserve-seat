@@ -20,6 +20,7 @@ import { api } from '../api';
 import type {
   LibraryArea,
   ScheduledTask,
+  SeatDetailResponse,
   SeatInfo,
   SeatsResponse,
   UserProfile,
@@ -48,6 +49,19 @@ function formatDateOffset(offsetDays: number): string {
   const m = String(d.getMonth() + 1).padStart(2, '0');
   const day = String(d.getDate()).padStart(2, '0');
   return `${y}-${m}-${day}`;
+}
+
+function parseTimeToMin(timeStr: string): number {
+  const [h, m] = (timeStr || '').split(':').map(Number);
+  if (Number.isNaN(h) || Number.isNaN(m)) return 0;
+  return h * 60 + m;
+}
+
+function formatMinToTime(minutes: number): string {
+  const clamped = Math.max(0, Math.min(24 * 60, Math.round(minutes)));
+  const h = Math.floor(clamped / 60);
+  const m = clamped % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 }
 
 const TIME_PRESETS = [
@@ -86,6 +100,10 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
   const reqSeqRef = useRef(0);
 
   const [selectedSeat, setSelectedSeat] = useState<SeatInfo | null>(null);
+  const [seatDetail, setSeatDetail] = useState<SeatDetailResponse | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
+  const detailSeqRef = useRef(0);
   const [bookStart, setBookStart] = useState('08:30');
   const [bookEnd, setBookEnd] = useState('22:00');
   const [booking, setBooking] = useState(false);
@@ -219,15 +237,72 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
     return () => window.clearInterval(timer);
   }, [user, activeServerTask, syncServerTasks]);
 
+  // 选中具体座位时，实时向后端请求该座位的真实可约起始/结束时间、开放时段与最新占用
+  const loadSeatDetail = useCallback(
+    async (devId: string, targetAreaId: string, targetDate: string) => {
+      const seq = ++detailSeqRef.current;
+      setDetailLoading(true);
+      setDetailError(null);
+      try {
+        const res = await api.library.seatDetail({
+          devId,
+          areaId: targetAreaId,
+          date: targetDate,
+        });
+        if (seq !== detailSeqRef.current) return;
+        setSeatDetail(res);
+
+        // 按该座位实时返回的真实可约区间与单次最长时长自动填入起止时间
+        const bestSlot = res.seat.longestFreeSlot || res.seat.freeSlots[0] || null;
+        if (bestSlot) {
+          const maxDur = res.rule?.maxResvTime || 0;
+          const clampedEnd =
+            maxDur > 0 && bestSlot.end - bestSlot.start > maxDur
+              ? formatMinToTime(bestSlot.start + maxDur)
+              : bestSlot.endStr;
+          setBookStart(bestSlot.startStr);
+          setBookEnd(clampedEnd);
+        } else {
+          setBookStart(res.bookableStart || res.openStart);
+          setBookEnd(res.bookableEnd || res.openEnd);
+        }
+      } catch (err: any) {
+        if (seq !== detailSeqRef.current) return;
+        setDetailError(err?.message || '拉取该座位实时可约时间失败');
+      } finally {
+        if (seq === detailSeqRef.current) {
+          setDetailLoading(false);
+        }
+      }
+    },
+    [],
+  );
+
   useEffect(() => {
-    if (selectedSeat?.longestFreeSlot) {
-      setBookStart(selectedSeat.longestFreeSlot.startStr);
-      setBookEnd(selectedSeat.longestFreeSlot.endStr);
-    } else {
-      setBookStart(data?.effectiveStartTime || startTime);
-      setBookEnd(data?.effectiveEndTime || endTime);
+    if (!selectedSeat) {
+      setSeatDetail(null);
+      setDetailError(null);
+      return;
     }
-  }, [selectedSeat, data?.effectiveStartTime, data?.effectiveEndTime, startTime, endTime]);
+    // 先用已有列表数据做瞬时占位，紧接着发起该座位的实时请求覆盖为精确值
+    if (selectedSeat.longestFreeSlot) {
+      const maxDur = selectedSeat.rule?.maxResvTime || 0;
+      const s = selectedSeat.longestFreeSlot;
+      const clampedEnd =
+        maxDur > 0 && s.end - s.start > maxDur ? formatMinToTime(s.start + maxDur) : s.endStr;
+      setBookStart(s.startStr);
+      setBookEnd(clampedEnd);
+    } else {
+      setBookStart(selectedSeat.openStart || data?.effectiveStartTime || startTime);
+      setBookEnd(selectedSeat.openEnd || data?.effectiveEndTime || endTime);
+    }
+    void loadSeatDetail(selectedSeat.devId, selectedSeat.areaId, date);
+  }, [
+    selectedSeat?.devId,
+    selectedSeat?.areaId,
+    date,
+    loadSeatDetail,
+  ]);
 
   const matchedSeatIds = useMemo(() => {
     const seats = data?.seats || [];
@@ -360,7 +435,11 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
         endTime: bookEnd,
       });
       setFeedback({ type: 'success', text: res.message });
-      await Promise.all([loadSeats(), onBookedSuccess()]);
+      await Promise.all([
+        loadSeats(),
+        loadSeatDetail(selectedSeat.devId, selectedSeat.areaId, date),
+        onBookedSuccess(),
+      ]);
     } catch (err: any) {
       setFeedback({ type: 'error', text: err?.message || '预约失败' });
     } finally {
@@ -870,182 +949,474 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
 
         {/* Right Seat Detail & Booking Panel */}
         <div className="rounded-xl border border-[#DCE4EE] bg-white p-5 lg:col-span-4">
-          <h3 className="text-sm font-semibold text-[#0D223D]">座位详情与快速预约</h3>
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="text-sm font-semibold text-[#0D223D]">座位详情与快速预约</h3>
+            {selectedSeat && (
+              <button
+                type="button"
+                onClick={() => void loadSeatDetail(selectedSeat.devId, selectedSeat.areaId, date)}
+                disabled={detailLoading}
+                className="inline-flex items-center gap-1 rounded-md border border-[#DCE4EE] bg-[#F8FAFC] px-2 py-1 text-[11px] font-medium text-[#4D627A] hover:border-[#0D386B] hover:text-[#0D386B] disabled:opacity-50"
+                title="重新实时请求该座位的精确可约起止时间"
+              >
+                <RefreshCw className={`h-3 w-3 ${detailLoading ? 'animate-spin' : ''}`} />
+                {detailLoading ? '实时拉取中...' : '实时查询该座'}
+              </button>
+            )}
+          </div>
 
           {!selectedSeat ? (
             <p className="mt-6 text-sm text-[#64748B]">请在左侧座位图中选择一个座位。</p>
           ) : (
-            <div className="mt-4 space-y-4">
-              <div className="rounded-xl border border-[#DCE4EE] bg-[#F8FAFC] p-4">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-xs text-[#4D627A]">{selectedSeat.areaName}</p>
-                    <p className="mt-0.5 font-mono text-xl font-bold text-[#0D386B]">
-                      {selectedSeat.devName}
-                    </p>
-                  </div>
-                  <span
-                    className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
-                      selectedSeat.status === 'free'
-                        ? 'bg-emerald-100 text-emerald-800'
-                        : selectedSeat.status === 'partial'
-                          ? 'bg-amber-100 text-amber-800'
-                          : selectedSeat.status === 'unreleased'
-                            ? 'bg-slate-200 text-[#0D386B]'
-                            : 'bg-slate-200 text-slate-600'
-                    }`}
-                  >
-                    {selectedSeat.status === 'free'
-                      ? '全时段可约'
-                      : selectedSeat.status === 'partial'
-                        ? `部分时段可约 (${selectedSeat.freeRate}%)`
-                        : selectedSeat.status === 'unreleased'
-                          ? '该批次未放座'
-                          : '该时段已约满'}
-                  </span>
-                </div>
+            (() => {
+              const matchedDetail =
+                seatDetail &&
+                seatDetail.seat.devId === selectedSeat.devId &&
+                seatDetail.targetDate === date
+                  ? seatDetail
+                  : null;
+              const activeSeat = matchedDetail ? matchedDetail.seat : selectedSeat;
+              const openStartStr = matchedDetail?.openStart || activeSeat.openStart || '08:00';
+              const openEndStr = matchedDetail?.openEnd || activeSeat.openEnd || '22:00';
+              const seatRule = matchedDetail?.rule || activeSeat.rule;
+              const maxDurMin = seatRule?.maxResvTime || 0;
+              const minDurMin = seatRule?.minResvTime || 30;
+              const bookableStartStr =
+                matchedDetail?.bookableStart ?? activeSeat.bookableStart ?? activeSeat.freeSlots[0]?.startStr ?? null;
+              const bookableEndStr =
+                matchedDetail?.bookableEnd ??
+                activeSeat.bookableEnd ??
+                (activeSeat.freeSlots.length > 0
+                  ? activeSeat.freeSlots[activeSeat.freeSlots.length - 1].endStr
+                  : null);
 
-                {/* 08:00-22:00 visual occupancy bar */}
-                <div className="mt-4">
-                  <div className="mb-1 flex justify-between font-mono text-[10px] text-[#64748B]">
-                    <span>08:00</span>
-                    <span>12:00</span>
-                    <span>16:00</span>
-                    <span>20:00</span>
-                    <span>22:00</span>
-                  </div>
-                  <div
-                    className={`relative h-3 w-full overflow-hidden rounded-full ${
-                      selectedSeat.status === 'unreleased' ? 'bg-slate-200' : 'bg-emerald-200'
-                    }`}
-                  >
-                    {selectedSeat.busySlots.map((slot, idx) => {
-                      const dayStart = 8 * 60;
-                      const daySpan = 14 * 60;
-                      const left = Math.max(0, ((slot.start - dayStart) / daySpan) * 100);
-                      const width = Math.min(
-                        100 - left,
-                        Math.max(2, ((slot.end - slot.start) / daySpan) * 100),
-                      );
-                      return (
-                        <div
-                          key={idx}
-                          title={`已占用 ${slot.startStr}-${slot.endStr}`}
-                          style={{ left: `${left}%`, width: `${width}%` }}
-                          className="absolute top-0 bottom-0 bg-red-500/80"
-                        />
-                      );
-                    })}
-                  </div>
-                </div>
-              </div>
+              const dayStart = parseTimeToMin(openStartStr);
+              const dayEnd = Math.max(dayStart + 60, parseTimeToMin(openEndStr));
+              const daySpan = dayEnd - dayStart;
+              const ticks = [0, 0.25, 0.5, 0.75, 1].map((ratio) =>
+                formatMinToTime(dayStart + daySpan * ratio),
+              );
 
-              {/* Free Slots */}
-              <div>
-                <p className="text-xs font-medium text-[#4D627A]">
-                  校准后可用空闲时间段（点击填入）
-                </p>
-                {selectedSeat.status === 'unreleased' ? (
-                  <p className="mt-1.5 text-xs text-[#0D386B]">
-                    {data?.batchStatus?.message ||
-                      '该日期尚未开放预约，可点击下方按钮提前设为 18:01 自动抢座心仪座位。'}
-                  </p>
-                ) : selectedSeat.freeSlots.length === 0 ? (
-                  <p className="mt-1.5 text-xs text-red-600">
-                    当前校准时段内没有剩余空档，可开启上方「服务器端轮询找座」持续盯座。
-                  </p>
-                ) : (
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    {selectedSeat.freeSlots.map((slot, idx) => (
-                      <button
-                        key={idx}
-                        type="button"
-                        onClick={() => {
-                          setBookStart(slot.startStr);
-                          setBookEnd(slot.endStr);
-                        }}
-                        className="rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 font-mono text-xs font-medium text-emerald-800 hover:border-emerald-400"
+              const toRangeStyle = (s: number, e: number, minWidthPct = 1) => {
+                const cs = Math.max(dayStart, Math.min(dayEnd, s));
+                const ce = Math.max(dayStart, Math.min(dayEnd, e));
+                if (ce <= cs) return null;
+                const left = ((cs - dayStart) / daySpan) * 100;
+                const width = Math.min(
+                  100 - left,
+                  Math.max(minWidthPct, ((ce - cs) / daySpan) * 100),
+                );
+                return { left: `${left}%`, width: `${width}%` };
+              };
+
+              const selStartMin = parseTimeToMin(bookStart);
+              const selEndMin = parseTimeToMin(bookEnd);
+              const selStyle =
+                activeSeat.status !== 'unreleased' && selEndMin > selStartMin
+                  ? toRangeStyle(selStartMin, selEndMin, 1.5)
+                  : null;
+              const selConflictBusy =
+                selEndMin > selStartMin &&
+                activeSeat.busySlots.some((b) => b.start < selEndMin && b.end > selStartMin);
+              const selOutOfOpen =
+                selEndMin > selStartMin && (selStartMin < dayStart || selEndMin > dayEnd);
+              const selOverMax =
+                maxDurMin > 0 && selEndMin > selStartMin && selEndMin - selStartMin > maxDurMin;
+              const selHasIssue = selConflictBusy || selOutOfOpen || selOverMax;
+
+              // 根据用户当前选择的起点，实时计算该起点在该座位下最晚可约的结束时间
+              const containingFreeSlot = activeSeat.freeSlots.find(
+                (slot) => selStartMin >= slot.start && selStartMin < slot.end,
+              );
+              const suggestedMaxEndMin = containingFreeSlot
+                ? maxDurMin > 0
+                  ? Math.min(containingFreeSlot.end, selStartMin + maxDurMin)
+                  : containingFreeSlot.end
+                : null;
+              const suggestedMaxEndStr =
+                suggestedMaxEndMin && suggestedMaxEndMin > selStartMin
+                  ? formatMinToTime(suggestedMaxEndMin)
+                  : null;
+
+              const pastEndMin =
+                date === todayStr && data?.timeCalibrated && data?.effectiveStartTime
+                  ? parseTimeToMin(data.effectiveStartTime)
+                  : 0;
+              const pastStyle =
+                activeSeat.status !== 'unreleased' && pastEndMin > dayStart
+                  ? toRangeStyle(dayStart, pastEndMin, 0.5)
+                  : null;
+
+              const openWindows = matchedDetail?.openWindows || activeSeat.openWindows || [];
+
+              return (
+                <div className="mt-4 space-y-4">
+                  <div className="rounded-xl border border-[#DCE4EE] bg-[#F8FAFC] p-4">
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <p className="text-xs text-[#4D627A]">{activeSeat.areaName}</p>
+                        <p className="mt-0.5 font-mono text-xl font-bold text-[#0D386B]">
+                          {activeSeat.devName}
+                        </p>
+                      </div>
+                      <span
+                        className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
+                          activeSeat.status === 'free'
+                            ? 'bg-emerald-100 text-emerald-800'
+                            : activeSeat.status === 'partial'
+                              ? 'bg-amber-100 text-amber-800'
+                              : activeSeat.status === 'unreleased'
+                                ? 'bg-slate-200 text-[#0D386B]'
+                                : 'bg-slate-200 text-slate-600'
+                        }`}
                       >
-                        {slot.startStr} – {slot.endStr}
-                      </button>
-                    ))}
+                        {activeSeat.status === 'free'
+                          ? '全时段可约'
+                          : activeSeat.status === 'partial'
+                            ? `部分时段可约 (${activeSeat.freeRate}%)`
+                            : activeSeat.status === 'unreleased'
+                              ? '该批次未放座'
+                              : '该时段已约满'}
+                      </span>
+                    </div>
+
+                    {/* 该座位实时请求得到的真实开放起止与规则 */}
+                    <div className="mt-3 grid grid-cols-2 gap-2 rounded-lg border border-[#DCE4EE] bg-white px-3 py-2 text-[11px]">
+                      <div>
+                        <span className="text-[#64748B]">该座开放时段</span>
+                        <div className="mt-0.5 font-mono font-semibold text-[#0D223D]">
+                          {openStartStr} – {openEndStr}
+                        </div>
+                      </div>
+                      <div>
+                        <span className="text-[#64748B]">当前可约起止</span>
+                        <div className="mt-0.5 font-mono font-semibold text-emerald-700">
+                          {detailLoading && !matchedDetail
+                            ? '查询中...'
+                            : bookableStartStr && bookableEndStr
+                              ? `${bookableStartStr} – ${bookableEndStr}`
+                              : '暂无可约区间'}
+                        </div>
+                      </div>
+                      <div className="col-span-2 flex flex-wrap items-center justify-between gap-1 border-t border-[#EEF2F6] pt-1.5 text-[10px] text-[#64748B]">
+                        <span>
+                          单次最短 <strong className="font-mono text-[#0D223D]">{minDurMin}</strong> 分钟
+                          {maxDurMin > 0 ? (
+                            <>
+                              {' '}· 最长 <strong className="font-mono text-[#0D223D]">{maxDurMin}</strong> 分钟
+                            </>
+                          ) : (
+                            ' · 闭馆前不限单次时长'
+                          )}
+                        </span>
+                        <span className="font-mono text-[#0D386B]">
+                          {matchedDetail
+                            ? matchedDetail.source === 'device_api'
+                              ? '单座实时接口'
+                              : matchedDetail.source === 'room_api'
+                                ? '实时同步'
+                                : '演练数据'
+                            : detailLoading
+                              ? '实时请求中'
+                              : '列表预览'}
+                        </span>
+                      </div>
+                    </div>
+
+                    {detailError && (
+                      <p className="mt-2 text-[11px] text-amber-700">
+                        单座实时拉取提示：{detailError}（当前展示最近列表缓存）
+                      </p>
+                    )}
+
+                    {/* 动态按该座真实 openStart-openEnd 绘制的时间条 */}
+                    <div className="mt-3.5">
+                      <div className="mb-1 flex justify-between font-mono text-[10px] text-[#64748B]">
+                        {ticks.map((t, i) => (
+                          <span key={i}>{t}</span>
+                        ))}
+                      </div>
+                      <div
+                        className={`relative h-3.5 w-full overflow-hidden rounded-full border ${
+                          activeSeat.status === 'unreleased'
+                            ? 'border-slate-300 bg-slate-200'
+                            : activeSeat.status === 'occupied'
+                              ? 'border-rose-200 bg-slate-200'
+                              : 'border-emerald-300 bg-slate-200'
+                        }`}
+                      >
+                        {/* 开放窗口底色（支持多段开放窗口，闭馆/午休间隙自然呈灰色） */}
+                        {activeSeat.status !== 'unreleased' &&
+                          (openWindows.length > 0
+                            ? openWindows
+                            : [{ start: dayStart, end: dayEnd, startStr: openStartStr, endStr: openEndStr, durationMin: daySpan }]
+                          ).map((win, idx) => {
+                            const style = toRangeStyle(win.start, win.end, 1);
+                            if (!style) return null;
+                            return (
+                              <div
+                                key={`open-${idx}`}
+                                title={`开放时段 ${win.startStr}-${win.endStr}`}
+                                style={style}
+                                className="absolute top-0 bottom-0 bg-emerald-100"
+                              />
+                            );
+                          })}
+
+                        {/* 实际可预约空闲时段（绿色） */}
+                        {activeSeat.status !== 'unreleased' &&
+                          activeSeat.freeSlots.map((slot, idx) => {
+                            const style = toRangeStyle(slot.start, slot.end, 1);
+                            if (!style) return null;
+                            return (
+                              <div
+                                key={`free-${idx}`}
+                                title={`可约时段 ${slot.startStr}-${slot.endStr}`}
+                                style={style}
+                                className="absolute top-0 bottom-0 bg-emerald-400/85"
+                              />
+                            );
+                          })}
+
+                        {/* 今日已过时段（灰色遮罩） */}
+                        {pastStyle && (
+                          <div
+                            title={`已过时段 ${openStartStr}-${data?.effectiveStartTime}`}
+                            style={pastStyle}
+                            className="absolute top-0 bottom-0 bg-slate-400/55"
+                          />
+                        )}
+
+                        {/* 已被占用时段（红色） */}
+                        {activeSeat.busySlots.map((slot, idx) => {
+                          const style = toRangeStyle(slot.start, slot.end, 1.5);
+                          if (!style) return null;
+                          return (
+                            <div
+                              key={`busy-${idx}`}
+                              title={`已占用 ${slot.startStr}-${slot.endStr}`}
+                              style={style}
+                              className="absolute top-0 bottom-0 bg-rose-500/90"
+                            />
+                          );
+                        })}
+
+                        {/* 用户当前选择的预约时段（深蓝高亮，冲突/超限呈橙黄警示） */}
+                        {selStyle && (
+                          <div
+                            title={`当前所选预约 ${bookStart}-${bookEnd}${
+                              selConflictBusy
+                                ? '（与已占时段冲突）'
+                                : selOverMax
+                                  ? `（超过单次最长 ${maxDurMin} 分钟限制）`
+                                  : selOutOfOpen
+                                    ? `（超出开放时段 ${openStartStr}-${openEndStr}）`
+                                    : ''
+                            }`}
+                            style={selStyle}
+                            className={`pointer-events-none absolute top-0 bottom-0 rounded-full border border-white/80 transition-all duration-150 ${
+                              selHasIssue ? 'bg-amber-500/85' : 'bg-[#0D386B]/80'
+                            }`}
+                          />
+                        )}
+                      </div>
+
+                      {/* 图例与占用摘要 */}
+                      <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-[#64748B]">
+                        <div className="flex flex-wrap items-center gap-2.5">
+                          <span className="inline-flex items-center gap-1">
+                            <span className="h-2 w-2 rounded-full bg-emerald-400" />
+                            可约
+                          </span>
+                          <span className="inline-flex items-center gap-1">
+                            <span className="h-2 w-2 rounded-full bg-rose-500" />
+                            已占
+                          </span>
+                          {selStyle && (
+                            <span
+                              className={`inline-flex items-center gap-1 font-medium ${
+                                selHasIssue ? 'text-amber-700' : 'text-[#0D386B]'
+                              }`}
+                            >
+                              <span
+                                className={`h-2 w-2 rounded-full ${
+                                  selHasIssue ? 'bg-amber-500' : 'bg-[#0D386B]'
+                                }`}
+                              />
+                              {selConflictBusy
+                                ? '与已占时段冲突'
+                                : selOverMax
+                                  ? `超单次上限(${maxDurMin}分)`
+                                  : selOutOfOpen
+                                    ? '超出开放时间'
+                                    : `已选 ${bookStart}-${bookEnd}`}
+                            </span>
+                          )}
+                          {pastStyle && (
+                            <span className="inline-flex items-center gap-1">
+                              <span className="h-2 w-2 rounded-full bg-slate-400/70" />
+                              已过
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      {activeSeat.busySlots.length > 0 && (
+                        <p className="mt-1.5 font-mono text-[11px] text-rose-600">
+                          已占时段：
+                          {activeSeat.busySlots
+                            .map((s) => `${s.startStr}-${s.endStr}`)
+                            .join('、')}
+                        </p>
+                      )}
+                    </div>
                   </div>
-                )}
-              </div>
 
-              {/* Booking Time Inputs */}
-              <div className="grid grid-cols-2 gap-2.5">
-                <div>
-                  <label className="mb-1 block text-xs font-medium text-[#4D627A]">预约开始</label>
-                  <input
-                    type="time"
-                    value={bookStart}
-                    onChange={(e) => setBookStart(e.target.value)}
-                    className="w-full rounded-lg border border-[#CBD5E1] px-3 py-2 font-mono text-sm"
-                  />
-                </div>
-                <div>
-                  <label className="mb-1 block text-xs font-medium text-[#4D627A]">预约结束</label>
-                  <input
-                    type="time"
-                    value={bookEnd}
-                    onChange={(e) => setBookEnd(e.target.value)}
-                    className="w-full rounded-lg border border-[#CBD5E1] px-3 py-2 font-mono text-sm"
-                  />
-                </div>
-              </div>
+                  {/* Free Slots */}
+                  <div>
+                    <p className="text-xs font-medium text-[#4D627A]">
+                      该座实时可预约空闲段（点击填入）
+                    </p>
+                    {activeSeat.status === 'unreleased' ? (
+                      <p className="mt-1.5 text-xs text-[#0D386B]">
+                        {matchedDetail?.reason ||
+                          data?.batchStatus?.message ||
+                          '该日期尚未开放预约，可点击下方按钮提前设为 18:01 自动抢座心仪座位。'}
+                      </p>
+                    ) : activeSeat.freeSlots.length === 0 ? (
+                      <p className="mt-1.5 text-xs text-red-600">
+                        该座位今日/当日暂无剩余可约空档，可开启上方「服务器端轮询找座」持续盯座。
+                      </p>
+                    ) : (
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {activeSeat.freeSlots.map((slot, idx) => {
+                          const clampedEnd =
+                            maxDurMin > 0 && slot.end - slot.start > maxDurMin
+                              ? formatMinToTime(slot.start + maxDurMin)
+                              : slot.endStr;
+                          const isCurrent = bookStart === slot.startStr && bookEnd === clampedEnd;
+                          return (
+                            <button
+                              key={idx}
+                              type="button"
+                              onClick={() => {
+                                setBookStart(slot.startStr);
+                                setBookEnd(clampedEnd);
+                              }}
+                              className={`rounded-lg border px-2.5 py-1.5 font-mono text-xs font-medium transition-colors ${
+                                isCurrent
+                                  ? 'border-[#0D386B] bg-[#0D386B] text-white'
+                                  : 'border-emerald-200 bg-emerald-50 text-emerald-800 hover:border-emerald-400'
+                              }`}
+                            >
+                              {slot.startStr} – {slot.endStr}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
 
-              {feedback && (
-                <div
-                  className={`flex items-start gap-2 rounded-lg border px-3 py-2.5 text-xs ${
-                    feedback.type === 'success'
-                      ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
-                      : 'border-red-200 bg-red-50 text-red-700'
-                  }`}
-                >
-                  {feedback.type === 'success' ? (
-                    <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
-                  ) : (
-                    <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                  {/* Booking Time Inputs */}
+                  <div>
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <div>
+                        <label className="mb-1 block text-xs font-medium text-[#4D627A]">
+                          预约开始（最早 {bookableStartStr || openStartStr}）
+                        </label>
+                        <input
+                          type="time"
+                          min={bookableStartStr || openStartStr}
+                          max={openEndStr}
+                          value={bookStart}
+                          onChange={(e) => setBookStart(e.target.value)}
+                          className="w-full rounded-lg border border-[#CBD5E1] px-3 py-2 font-mono text-sm"
+                        />
+                      </div>
+                      <div>
+                        <label className="mb-1 block text-xs font-medium text-[#4D627A]">
+                          预约结束（最晚 {suggestedMaxEndStr || bookableEndStr || openEndStr}）
+                        </label>
+                        <input
+                          type="time"
+                          min={bookStart}
+                          max={suggestedMaxEndStr || openEndStr}
+                          value={bookEnd}
+                          onChange={(e) => setBookEnd(e.target.value)}
+                          className="w-full rounded-lg border border-[#CBD5E1] px-3 py-2 font-mono text-sm"
+                        />
+                      </div>
+                    </div>
+
+                    {suggestedMaxEndStr && selEndMin > (suggestedMaxEndMin ?? 0) && (
+                      <div className="mt-2 flex items-center justify-between rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-[11px] text-amber-900">
+                        <span>
+                          从 {bookStart} 起该座位最晚可约至 <strong className="font-mono">{suggestedMaxEndStr}</strong>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setBookEnd(suggestedMaxEndStr)}
+                          className="rounded bg-[#DF7900] px-2 py-0.5 font-semibold text-white hover:bg-[#C66B00]"
+                        >
+                          自动校准
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  {feedback && (
+                    <div
+                      className={`flex items-start gap-2 rounded-lg border px-3 py-2.5 text-xs ${
+                        feedback.type === 'success'
+                          ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                          : 'border-red-200 bg-red-50 text-red-700'
+                      }`}
+                    >
+                      {feedback.type === 'success' ? (
+                        <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
+                      ) : (
+                        <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                      )}
+                      <span>{feedback.text}</span>
+                    </div>
                   )}
-                  <span>{feedback.text}</span>
+
+                  <button
+                    type="button"
+                    onClick={handleBook}
+                    disabled={
+                      booking ||
+                      activeSeat.status === 'occupied' ||
+                      activeSeat.status === 'unreleased'
+                    }
+                    className="flex w-full items-center justify-center gap-2 rounded-lg bg-[#0D386B] px-4 py-2.5 text-sm font-semibold text-white hover:bg-[#0A2C55] disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Sparkles className="h-4 w-4" />
+                    {activeSeat.status === 'unreleased'
+                      ? '该批次尚未放座（请使用下方 18:01 自动抢座）'
+                      : booking
+                        ? '正在提交预约...'
+                        : `确认预约 ${activeSeat.devName}`}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onJumpToScheduler({
+                        areaId: activeSeat.areaId,
+                        seatNumber: activeSeat.seatNumber,
+                        startTime: bookStart,
+                        endTime: bookEnd,
+                      })
+                    }
+                    className="flex w-full items-center justify-center gap-2 rounded-lg border border-[#DCE4EE] bg-[#F8FAFC] px-4 py-2 text-xs font-semibold text-[#0D386B] hover:bg-[#E7EEF7]"
+                  >
+                    <CalendarClock className="h-4 w-4 text-[#DF7900]" />
+                    设为 18:01 定期抢座心仪座位
+                  </button>
                 </div>
-              )}
-
-              <button
-                type="button"
-                onClick={handleBook}
-                disabled={
-                  booking ||
-                  selectedSeat.status === 'occupied' ||
-                  selectedSeat.status === 'unreleased'
-                }
-                className="flex w-full items-center justify-center gap-2 rounded-lg bg-[#0D386B] px-4 py-2.5 text-sm font-semibold text-white hover:bg-[#0A2C55] disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <Sparkles className="h-4 w-4" />
-                {selectedSeat.status === 'unreleased'
-                  ? '该批次尚未放座（请使用下方 18:01 自动抢座）'
-                  : booking
-                    ? '正在提交预约...'
-                    : `确认预约 ${selectedSeat.devName}`}
-              </button>
-
-              <button
-                type="button"
-                onClick={() =>
-                  onJumpToScheduler({
-                    areaId: selectedSeat.areaId,
-                    seatNumber: selectedSeat.seatNumber,
-                    startTime: bookStart,
-                    endTime: bookEnd,
-                  })
-                }
-                className="flex w-full items-center justify-center gap-2 rounded-lg border border-[#DCE4EE] bg-[#F8FAFC] px-4 py-2 text-xs font-semibold text-[#0D386B] hover:bg-[#E7EEF7]"
-              >
-                <CalendarClock className="h-4 w-4 text-[#DF7900]" />
-                设为 18:01 定期抢座心仪座位
-              </button>
-            </div>
+              );
+            })()
           )}
         </div>
       </div>

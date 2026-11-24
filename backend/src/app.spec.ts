@@ -173,6 +173,74 @@ describe('DLUFL Library System Core Flows', () => {
     assert.equal(todayPacket.bookable, true);
     assert.equal(todayPacket.status, 'free');
 
+    // 实时数据包测试 1b：验证 resvInfo 毫秒时间戳严格按北京时间(+08:00)解析，不受服务器 UTC 时区偏移影响
+    const busyPacket = icspService.evaluateDeviceFromPacket(
+      {
+        devId: 2,
+        devName: '2M-002',
+        devProp: 2,
+        openStart: '08:00',
+        openEnd: '22:00',
+        openTimes: [{ openStartTime: '08:00', openEndTime: '22:00' }],
+        resvRule: { earliestResvTime: 840, latestResvTime: 0, minResvTime: 30, maxResvTime: 840 },
+        resvInfo: [
+          {
+            start: new Date('2026-11-25T08:30:00+08:00').getTime(),
+            end: new Date('2026-11-25T14:00:00+08:00').getTime(),
+            resvStatus: 1027,
+          },
+        ],
+      },
+      '2026-11-25',
+      '08:30',
+      '22:00',
+      true,
+      midnightNow,
+    );
+    assert.equal(busyPacket.status, 'partial');
+    assert.equal(busyPacket.busySlots.length, 1);
+    assert.equal(busyPacket.busySlots[0].startStr, '08:30');
+    assert.equal(busyPacket.busySlots[0].endStr, '14:00');
+    assert.equal(busyPacket.freeSlots[0].startStr, '14:00');
+    assert.equal(busyPacket.freeSlots[0].endStr, '22:00');
+
+    // 实时数据包测试 1c：每个座位独立 openTimes（如 08:00-21:00）与 maxResvTime 必须精确透出
+    const customOpenPacket = icspService.evaluateDeviceFromPacket(
+      {
+        devId: 3,
+        devName: '6E-018',
+        devProp: 2,
+        openTimes: [{ openStartTime: '08:00', openEndTime: '21:00' }],
+        resvRule: { earliestResvTime: 840, latestResvTime: 0, minResvTime: 30, maxResvTime: 240 },
+        resvInfo: [
+          {
+            start: new Date('2026-11-25T10:00:00+08:00').getTime(),
+            end: new Date('2026-11-25T13:00:00+08:00').getTime(),
+            resvStatus: 1027,
+          },
+        ],
+      },
+      '2026-11-25',
+      '08:00',
+      '21:00',
+      true,
+      midnightNow,
+    );
+    assert.equal(customOpenPacket.openStart, '08:00');
+    assert.equal(customOpenPacket.openEnd, '21:00');
+    assert.equal(customOpenPacket.bookableStart, '08:00');
+    assert.equal(customOpenPacket.bookableEnd, '21:00');
+    assert.equal(customOpenPacket.rule.maxResvTime, 240);
+    assert.equal(customOpenPacket.freeSlots.length, 2);
+    assert.equal(customOpenPacket.freeSlots[1].endStr, '21:00');
+
+    // 验证单座实时详情接口 fetchSeatDetail 在模拟模式下返回完整起止时间与规则
+    const detailRes = await icspService.fetchSeatDetail(user, '100475787', freeSeat.devId, todayDate);
+    assert.equal(detailRes.seat.devId, freeSeat.devId);
+    assert.equal(detailRes.openStart, '08:00');
+    assert.equal(detailRes.openEnd, '22:00');
+    assert.ok(detailRes.rule.minResvTime >= 15);
+
     // 实时数据包测试 2：次日 2026-11-26 在 00:42 尚未放座（openTimes 为空 或 超出 earliestResvTime=840）
     const tomorrowPacket = icspService.evaluateDeviceFromPacket(
       {
@@ -254,6 +322,21 @@ describe('DLUFL Library System Core Flows', () => {
     // 验证解绑后统计立即扣减为 0，重新绑定同一学号恢复为 1（不会重复累加）
     icspService.unbindUserCredentials(user.id);
     assert.equal(statsService.getOverview(user).registeredUsers, 0);
+
+    // 验证通过 CASTGC 免密自动绑定 ICSpace（无需存密码），且解绑时同步清空 encrypted_cas_tgc
+    const tgcBind = await icspService.bindUserWithTgc(user, 'CASTGC=TGT-mock-123456');
+    assert.equal(tgcBind.bound, true);
+    const afterTgc = casService.findUserById(user.id)!;
+    assert.equal(afterTgc.icspace_bound, 1);
+    assert.ok(afterTgc.encrypted_cas_tgc);
+    assert.equal(afterTgc.encrypted_cas_password, null);
+    assert.equal(statsService.getOverview(afterTgc).registeredUsers, 1);
+
+    icspService.unbindUserCredentials(user.id);
+    const afterUnbind = casService.findUserById(user.id)!;
+    assert.equal(afterUnbind.encrypted_cas_tgc, null);
+    assert.equal(afterUnbind.icspace_bound, 0);
+
     icspService.markMockBound(user.id);
     assert.equal(statsService.getOverview(user).registeredUsers, 1);
 

@@ -330,7 +330,7 @@ export class CasService {
     rsa?: string;
     ul?: string;
     pl?: string;
-  }): Promise<CasResult<{ ticket: string; serviceUrl: string }>> {
+  }): Promise<CasResult<{ ticket: string; serviceUrl: string; tgcCookie: string }>> {
     const row = this.dbService.db
       .prepare(`SELECT * FROM cas_login_tokens WHERE token = ?`)
       .get(payload.token) as
@@ -427,7 +427,19 @@ export class CasService {
         return { success: false, message: '未能从 CAS 重定向中获取到 ticket' };
       }
 
-      return { success: true, data: { ticket: match[1], serviceUrl: row.service_url } };
+      const tgcOnlyCookie = parsedLoginCookies
+        .filter((c) => c.name.startsWith('CASTGC'))
+        .map((c) => `${c.name}=${c.value}`)
+        .join('; ');
+
+      return {
+        success: true,
+        data: {
+          ticket: match[1],
+          serviceUrl: row.service_url,
+          tgcCookie: tgcOnlyCookie || newCookie,
+        },
+      };
     } catch (e) {
       return { success: false, message: this.toErrMsg(e, '提交 CAS 登录失败') };
     }
@@ -496,6 +508,8 @@ export class CasService {
       idType: user.id_type,
       email: user.email,
       icspaceBound: Boolean(user.icspace_bound),
+      hasTgc: Boolean(user.encrypted_cas_tgc),
+      hasAutoRenew: Boolean(user.encrypted_cas_password),
       loginCount: user.login_count,
       lastLoginAt: user.last_login_at,
       createdAt: user.created_at,

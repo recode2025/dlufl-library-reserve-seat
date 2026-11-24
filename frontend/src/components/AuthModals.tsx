@@ -16,11 +16,12 @@ export const LoginModal: React.FC<LoginModalProps> = ({
   onClose,
   authConfig,
   onSuccess,
-  initialIntranetMode = false,
+  initialIntranetMode = true,
 }) => {
   const [tab, setTab] = useState<'cas' | 'intranet'>(initialIntranetMode ? 'intranet' : 'cas');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [rememberForSchedule, setRememberForSchedule] = useState(true);
   const [demoStudentId, setDemoStudentId] = useState('2023041101');
   const [demoName, setDemoName] = useState('林晓辰');
   const [loading, setLoading] = useState(false);
@@ -51,11 +52,17 @@ export const LoginModal: React.FC<LoginModalProps> = ({
         username: username.trim(),
         password,
         execution: tokenRes.execution,
+        rememberForSchedule,
       });
-      // 走标准服务端 /api/auth/cas/callback?ticket=... 完成票据验证与 Cookie 签发
+      if (submitRes.authenticated) {
+        setPassword('');
+        await onSuccess();
+        onClose();
+        return;
+      }
       window.location.href = submitRes.redirectUrl;
     } catch (err: any) {
-      setError(err?.message || '内网 CAS 登录失败');
+      setError(err?.message || 'CAS 登录失败');
       setLoading(false);
     }
   };
@@ -102,6 +109,20 @@ export const LoginModal: React.FC<LoginModalProps> = ({
             <button
               type="button"
               onClick={() => {
+                setTab('intranet');
+                setError(null);
+              }}
+              className={`border-b-2 pb-2.5 font-medium transition-colors ${
+                tab === 'intranet'
+                  ? 'border-[#0D386B] text-[#0D386B]'
+                  : 'border-transparent text-[#4D627A] hover:text-[#0D223D]'
+              }`}
+            >
+              一键登录（免二次授权）
+            </button>
+            <button
+              type="button"
+              onClick={() => {
                 setTab('cas');
                 setError(null);
               }}
@@ -112,20 +133,6 @@ export const LoginModal: React.FC<LoginModalProps> = ({
               }`}
             >
               跳转 CAS 官方登录
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setTab('intranet');
-                setError(null);
-              }}
-              className={`border-b-2 pb-2.5 font-medium transition-colors ${
-                tab === 'intranet'
-                  ? 'border-[#0D386B] text-[#0D386B]'
-                  : 'border-transparent text-[#4D627A] hover:text-[#0D223D]'
-              }`}
-            >
-              内网服务端直连
             </button>
           </div>
         </div>
@@ -177,7 +184,9 @@ export const LoginModal: React.FC<LoginModalProps> = ({
           ) : (
             <form onSubmit={handleIntranetSubmit} className="space-y-4">
               <p className="text-xs leading-relaxed text-[#4D627A]">
-                当客户端位于校园内网或无法直接打开外网 CAS 页面时，可通过 HTTPS 将凭据提交至后端服务端安全完成 CAS 协议编码并换取 ST 票据（前端不暴露任何加密脚本）。
+                服务端通过 HTTPS 完成大外 CAS 认证并获取{' '}
+                <span className="font-mono text-[#0D386B]">CASTGC</span>{' '}
+                票据后，将自动用该票据换取图书馆 ICSpace 会话，<strong>登录一次即可直接选座预约，无需二次输入密码</strong>。
               </p>
               <div>
                 <label className="mb-1.5 block text-sm font-medium text-[#0D223D]">学号 / 工号</label>
@@ -201,13 +210,24 @@ export const LoginModal: React.FC<LoginModalProps> = ({
                   required
                 />
               </div>
+              <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-[#DCE4EE] bg-[#F8FAFC] px-3 py-2 text-xs text-[#4D627A]">
+                <input
+                  type="checkbox"
+                  checked={rememberForSchedule}
+                  onChange={(e) => setRememberForSchedule(e.target.checked)}
+                  className="mt-0.5 accent-[#0D386B]"
+                />
+                <span>
+                  允许加密保存续期凭据（用于 <span className="font-mono">CASTGC</span> 过期后自动续期每日 18:01 抢座；不勾选则仅保存 <span className="font-mono">CASTGC</span> 票据，随时可一键清除）
+                </span>
+              </label>
               <button
                 type="submit"
                 disabled={loading}
                 className="flex w-full items-center justify-center gap-2 rounded-lg bg-[#0D386B] px-4 py-2.5 text-sm font-semibold text-white hover:bg-[#0A2C55] disabled:opacity-60"
               >
                 <Lock className="h-4 w-4" />
-                {loading ? '正在通过 CAS 验证...' : '加密验证并登录'}
+                {loading ? '正在验证 CAS 并自动打通 ICSpace...' : '一键登录并打通图书馆预约'}
               </button>
             </form>
           )}
@@ -345,7 +365,11 @@ export const IcspBindModal: React.FC<IcspBindModalProps> = ({
               }`}
             >
               <ShieldCheck className="h-3.5 w-3.5" />
-              {user.icspaceBound ? '已授权' : '未授权'}
+              {user.icspaceBound
+                ? user.hasTgc && !user.hasAutoRenew
+                  ? 'CASTGC 已打通'
+                  : '已授权（含自动续期）'
+                : '未授权'}
             </span>
           </div>
 

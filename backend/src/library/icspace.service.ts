@@ -25,6 +25,13 @@ export interface TimeSlot {
   durationMin: number;
 }
 
+export interface SeatRuleInfo {
+  minResvTime: number;
+  maxResvTime: number;
+  earliestResvTime: number;
+  latestResvTime: number;
+}
+
 export interface SeatInfo {
   devId: string;
   devName: string;
@@ -38,6 +45,29 @@ export interface SeatInfo {
   longestFreeSlot: TimeSlot | null;
   freeSlots: TimeSlot[];
   busySlots: TimeSlot[];
+  openStart?: string;
+  openEnd?: string;
+  openWindows?: TimeSlot[];
+  bookableStart?: string | null;
+  bookableEnd?: string | null;
+  rule?: SeatRuleInfo;
+}
+
+export interface SeatDetailResponse {
+  seat: SeatInfo;
+  targetDate: string;
+  isLive: boolean;
+  source: 'device_api' | 'room_api' | 'mock';
+  bookable: boolean;
+  reason?: string;
+  releaseAt?: string;
+  openStart: string;
+  openEnd: string;
+  openWindows: TimeSlot[];
+  bookableStart: string | null;
+  bookableEnd: string | null;
+  rule: SeatRuleInfo;
+  fetchedAt: string;
 }
 
 export interface BatchReleaseStatus {
@@ -118,9 +148,23 @@ export class IcspService {
     return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
   }
 
-  private timestampToMinutes(ts: number): number {
-    const d = new Date(ts);
-    return d.getHours() * 60 + d.getMinutes();
+  private timestampToMinutes(ts: number | string): number {
+    if (typeof ts === 'string') {
+      const trimmed = ts.trim();
+      if (/^\d{1,2}:\d{2}/.test(trimmed)) {
+        return this.timeToMinutes(trimmed.slice(0, 5));
+      }
+      const parsedNum = Number(trimmed);
+      if (!Number.isNaN(parsedNum)) {
+        ts = parsedNum;
+      } else {
+        const parsedMs = Date.parse(trimmed);
+        if (Number.isNaN(parsedMs)) return 0;
+        return this.getBeijingNowInfo(new Date(parsedMs)).currentMin;
+      }
+    }
+    const ms = ts > 0 && ts < 1e11 ? ts * 1000 : ts;
+    return this.getBeijingNowInfo(new Date(ms)).currentMin;
   }
 
   private createClientFromCookies(cookies: Record<string, string>): AxiosInstance {
@@ -250,6 +294,149 @@ export class IcspService {
     };
   }
 
+  /**
+   * 直接利用 CAS 登录返回的 CASTGC Cookie 换取 ICSpace 会话（免二次输入密码）。
+   * 协议：带 Cookie: CASTGC=... 请求 /cas/login?service=<ICSpace回调> 换取 ST -> 跟进跳转落地 JSESSIONID + ic-cookie。
+   */
+  async authenticateIcspaceWithTgc(
+    tgcCookie: string,
+    fallbackStudentId = '',
+  ): Promise<CachedIcspaceSession> {
+    if (appConfig.mockMode) {
+      const sid = fallbackStudentId || 'mock_tgc_user';
+      return {
+        cookies: {
+          JSESSIONID: `mock_jsession_${sid}`,
+          'ic-cookie': `mock_ic_${sid}`,
+        },
+        accNo: sid,
+        token: `mock_token_${sid}`,
+        trueName: sid,
+        pid: sid,
+        updatedAt: Date.now(),
+      };
+    }
+
+    const serviceUrl = await this.getIcspaceServiceCallbackUrl();
+    const casHost = appConfig.cas.serverUrl;
+    const ticketResp = await axios.get(
+      `${casHost}${appConfig.cas.loginPath}?service=${encodeURIComponent(serviceUrl)}`,
+      {
+        headers: {
+          ...this.buildHeaders(),
+          Cookie: tgcCookie,
+        },
+        maxRedirects: 0,
+        validateStatus: (status) => status >= 200 && status < 400,
+        timeout: 15000,
+      },
+    );
+
+    const location = ticketResp.headers['location'];
+    if (!location || !/[?&]ticket=/.test(String(location))) {
+      throw new Error('CASTGC 会话已过期或无效，请重新登录刷新凭证');
+    }
+
+    // 使用独立 CookieJar 跟进 ICSpace 票据回调，避免将 CASTGC 泄露给非 CAS 域名
+    const icJar = new CookieJar();
+    const icFlowClient = wrapper(
+      axios.create({
+        jar: icJar,
+        headers: this.buildHeaders(),
+        timeout: 15000,
+      }),
+    );
+    await icFlowClient.get(String(location));
+
+    const cookiesList = await icJar.getCookies(appConfig.icspace.host);
+    const cookies: Record<string, string> = {};
+    for (const key of ['JSESSIONID', 'ic-cookie']) {
+      const found = cookiesList.find((c) => c.key === key)?.value;
+      if (found) cookies[key] = found;
+    }
+    if (!cookies['JSESSIONID'] || !cookies['ic-cookie']) {
+      throw new Error('通过 CASTGC 换取 ICSpace 会话 Cookie 失败');
+    }
+
+    const icClient = this.createClientFromCookies(cookies);
+    const userInfoResp = await icClient.get(`${appConfig.icspace.host}/ic-web/auth/userInfo`);
+    if (userInfoResp.data?.code !== 0 || !userInfoResp.data?.data) {
+      throw new Error(userInfoResp.data?.message || '获取 ICSpace 用户信息失败');
+    }
+
+    const info = userInfoResp.data.data;
+    return {
+      cookies,
+      accNo: String(info.accNo),
+      token: String(info.token || ''),
+      trueName: String(info.trueName || ''),
+      pid: String(info.pid || fallbackStudentId),
+      updatedAt: Date.now(),
+    };
+  }
+
+  /**
+   * 一次登录通过 CASTGC 自动完成 ICSpace 绑定，免二次输密码；
+   * 若用户勾选了允许长期自动续期（用于每日 18:01 无人值守定时抢座），则一并加密存储续期凭据。
+   */
+  async bindUserWithTgc(
+    user: UserRow,
+    tgcCookie: string,
+    optionalAutoRenewPassword?: string,
+  ): Promise<{
+    bound: boolean;
+    icspaceUser?: { accNo: string; trueName: string; pid: string };
+    notice?: string;
+  }> {
+    const now = new Date().toISOString();
+    const encTgc = encryptSecret(tgcCookie);
+    const encPwd = optionalAutoRenewPassword ? encryptSecret(optionalAutoRenewPassword) : null;
+
+    // 先保存加密后的 CASTGC（以及可选自动续期凭据）
+    if (encPwd) {
+      this.dbService.db
+        .prepare(
+          `UPDATE users SET encrypted_cas_tgc = ?, encrypted_cas_password = ?, updated_at = ? WHERE id = ?`,
+        )
+        .run(encTgc, encPwd, now, user.id);
+    } else {
+      this.dbService.db
+        .prepare(`UPDATE users SET encrypted_cas_tgc = ?, updated_at = ? WHERE id = ?`)
+        .run(encTgc, now, user.id);
+    }
+
+    try {
+      const session = await this.authenticateIcspaceWithTgc(tgcCookie, user.student_id);
+      const encSession = encryptSecret(JSON.stringify(session));
+      this.dbService.db
+        .prepare(
+          `UPDATE users
+           SET icspace_cookies_json = ?, icspace_bound = 1, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(encSession, new Date().toISOString(), user.id);
+
+      this.sessionCache.set(user.id, session);
+      void this.prewarmFloorPlans({ ...user, icspace_bound: 1, encrypted_cas_tgc: encTgc });
+      return {
+        bound: true,
+        icspaceUser: {
+          accNo: session.accNo,
+          trueName: session.trueName || user.name,
+          pid: session.pid || user.student_id,
+        },
+      };
+    } catch (e: any) {
+      this.logger.warn(
+        `Auto-binding ICSpace with CASTGC failed for user ${user.student_id}: ${e?.message}`,
+      );
+      return {
+        bound: false,
+        notice: e?.message || '已通过 CAS 登录，但自动换取 ICSpace 会话失败，请稍后重试',
+      };
+    }
+  }
+
   async bindUserCredentials(user: UserRow, password: string) {
     let session: CachedIcspaceSession;
     try {
@@ -309,7 +496,7 @@ export class IcspService {
     this.dbService.db
       .prepare(
         `UPDATE users
-         SET encrypted_cas_password = NULL, icspace_cookies_json = NULL, icspace_bound = 0, updated_at = ?
+         SET encrypted_cas_password = NULL, encrypted_cas_tgc = NULL, icspace_cookies_json = NULL, icspace_bound = 0, updated_at = ?
          WHERE id = ?`,
       )
       .run(now, userId);
@@ -357,9 +544,33 @@ export class IcspService {
       }
     }
 
+    // 优先使用加密保存的 CASTGC 免密换取新的 ICSpace 会话
+    if (user.encrypted_cas_tgc) {
+      try {
+        const plainTgc = decryptSecret(user.encrypted_cas_tgc);
+        const freshFromTgc = await this.authenticateIcspaceWithTgc(plainTgc, user.student_id);
+        const now = new Date().toISOString();
+        this.dbService.db
+          .prepare(`UPDATE users SET icspace_cookies_json = ?, updated_at = ? WHERE id = ?`)
+          .run(encryptSecret(JSON.stringify(freshFromTgc)), now, user.id);
+        this.sessionCache.set(user.id, freshFromTgc);
+        return freshFromTgc;
+      } catch (tgcErr: any) {
+        this.logger.warn(
+          `CASTGC session exchange failed for user ${user.student_id}: ${tgcErr?.message}`,
+        );
+        // 若用户未保存自动续期凭据，则提示重新登录刷新 CASTGC
+        if (!user.encrypted_cas_password) {
+          throw new BadRequestException(
+            'CASTGC 登录凭据已过期，请重新登录刷新，或在右上角授权弹窗中开启自动续期',
+          );
+        }
+      }
+    }
+
     if (!user.encrypted_cas_password) {
       throw new BadRequestException(
-        '尚未完成图书馆预约凭证授权，请先在右上角或预约授权弹窗中绑定大外统一身份密码',
+        '尚未完成图书馆预约凭证授权，请重新一键登录或在右上角授权弹窗中绑定大外统一身份凭据',
       );
     }
 
@@ -380,22 +591,34 @@ export class IcspService {
     return fresh;
   }
 
+  private parseSlotEndpoint(val: unknown): number {
+    if (typeof val === 'number') {
+      return val > 2000 ? this.timestampToMinutes(val) : val;
+    }
+    if (typeof val === 'string' && val.trim()) {
+      return this.timestampToMinutes(val);
+    }
+    return 0;
+  }
+
   private computeSeatIntervals(
-    rawResvInfo: Array<{ start: number; end: number }>,
+    rawResvInfo: Array<{ start?: number | string; end?: number | string; startTime?: number | string; endTime?: number | string }>,
     startMinutes: number,
     endMinutes: number,
   ): { busySlots: TimeSlot[]; freeSlots: TimeSlot[]; longestFreeSlot: TimeSlot | null; freeRate: number } {
     const busySlots: TimeSlot[] = [];
-    const sorted = [...(rawResvInfo || [])].sort((a, b) => a.start - b.start);
+    const normalized = (rawResvInfo || [])
+      .map((item) => ({
+        s: this.parseSlotEndpoint(item?.start ?? item?.startTime),
+        e: this.parseSlotEndpoint(item?.end ?? item?.endTime),
+      }))
+      .filter((item) => item.e > item.s)
+      .sort((a, b) => a.s - b.s);
 
     const freeSlots: TimeSlot[] = [];
     let lastEnd = startMinutes;
 
-    for (const item of sorted) {
-      const s = item.start > 2000 ? this.timestampToMinutes(item.start) : item.start;
-      const e = item.end > 2000 ? this.timestampToMinutes(item.end) : item.end;
-      if (e <= s) continue;
-
+    for (const { s, e } of normalized) {
       busySlots.push({
         start: s,
         end: e,
@@ -510,7 +733,7 @@ export class IcspService {
       if (!sessionUser) {
         sessionUser = this.dbService.db
           .prepare(
-            `SELECT * FROM users WHERE icspace_bound = 1 AND encrypted_cas_password IS NOT NULL ORDER BY updated_at DESC LIMIT 1`,
+            `SELECT * FROM users WHERE icspace_bound = 1 AND (encrypted_cas_tgc IS NOT NULL OR encrypted_cas_password IS NOT NULL) ORDER BY updated_at DESC LIMIT 1`,
           )
           .get() as UserRow | undefined;
       }
@@ -703,6 +926,43 @@ export class IcspService {
     return new Date(`${dateStr}T${normalized}+08:00`).getTime();
   }
 
+  private extractDeviceOpenWindows(device: any): TimeSlot[] {
+    const rawOpenTimes: Array<any> = Array.isArray(device?.openTimes) ? device.openTimes : [];
+    const openWindows: TimeSlot[] = [];
+    for (const ot of rawOpenTimes) {
+      const rawStart = ot?.openStartTime ?? ot?.startTime ?? ot?.beginTime ?? ot?.start;
+      const rawEnd = ot?.openEndTime ?? ot?.endTime ?? ot?.end;
+      if (rawStart !== undefined && rawEnd !== undefined && rawStart !== null && rawEnd !== null) {
+        const s = this.parseSlotEndpoint(rawStart);
+        const e = this.parseSlotEndpoint(rawEnd);
+        if (e > s) {
+          openWindows.push({
+            start: s,
+            end: e,
+            startStr: this.minutesToTime(s),
+            endStr: this.minutesToTime(e),
+            durationMin: e - s,
+          });
+        }
+      }
+    }
+    if (openWindows.length === 0) {
+      const os = device?.openStart ? this.parseSlotEndpoint(device.openStart) : 8 * 60;
+      const oe = device?.openEnd ? this.parseSlotEndpoint(device.openEnd) : 22 * 60;
+      if (oe > os) {
+        openWindows.push({
+          start: os,
+          end: oe,
+          startStr: this.minutesToTime(os),
+          endStr: this.minutesToTime(oe),
+          durationMin: oe - os,
+        });
+      }
+    }
+    openWindows.sort((a, b) => a.start - b.start);
+    return openWindows;
+  }
+
   /**
    * 依据实时抓取的 ICSpace 上游数据包（openTimes / resvRule / resvInfo）判断某日期与座位是否已开放预约，
    * 不再凭本地时间硬猜（彻底杜绝 00:xx 误判或图书馆临时调整放座时间导致的错判）。
@@ -723,24 +983,18 @@ export class IcspService {
     longestFreeSlot: TimeSlot | null;
     freeRate: number;
     status: SeatInfo['status'];
+    openStart: string;
+    openEnd: string;
+    openWindows: TimeSlot[];
+    bookableStart: string | null;
+    bookableEnd: string | null;
+    rule: SeatRuleInfo;
   } {
     const bj = this.getBeijingNowInfo(now);
     const todayUtc = Date.UTC(bj.year, bj.month - 1, bj.day);
     const [ty, tm, td] = targetDate.split('-').map(Number);
     const targetUtc = Date.UTC(ty, tm - 1, td);
     const diffDays = Math.round((targetUtc - todayUtc) / (24 * 60 * 60 * 1000));
-
-    if (diffDays < 0) {
-      return {
-        bookable: false,
-        reason: `${targetDate} 批次已过期`,
-        busySlots: [],
-        freeSlots: [],
-        longestFreeSlot: null,
-        freeRate: 0,
-        status: 'unreleased',
-      };
-    }
 
     const resvRule = device?.resvRule && typeof device.resvRule === 'object' ? device.resvRule : null;
     const hasRule = Boolean(resvRule && Object.keys(resvRule).length > 0);
@@ -750,61 +1004,51 @@ export class IcspService {
       ? device.openTimes
       : [];
 
-    // 1. 直接读取 ICSpace 数据包里的 openTimes 与 resvRule（与官方前端 judgeReserve 完全一致）
-    if (device?.openTimes !== undefined && rawOpenTimes.length === 0) {
-      return {
-        bookable: false,
-        reason: `ICSpace 返回 ${targetDate} 无开放时段（未放座或闭馆）`,
-        busySlots: [],
-        freeSlots: [],
-        longestFreeSlot: null,
-        freeRate: 0,
-        status: 'unreleased',
-      };
-    }
-    if (device?.resvRule !== undefined && !hasRule) {
-      return {
-        bookable: false,
-        reason: `ICSpace 返回 ${targetDate} 无可用预约规则（未放座）`,
-        busySlots: [],
-        freeSlots: [],
-        longestFreeSlot: null,
-        freeRate: 0,
-        status: 'unreleased',
-      };
-    }
-    if (device?.devProp !== undefined && (Number(device.devProp) & 2) === 0) {
-      return {
-        bookable: false,
-        reason: '该座位当前不可预约',
-        busySlots: [],
-        freeSlots: [],
-        longestFreeSlot: null,
-        freeRate: 0,
-        status: 'unreleased',
-      };
-    }
-
-    // 确定该日期的实际开放起止时间（优先取 ICSpace 实时返回的 openTimes / openStart / openEnd）
-    const openWindows: Array<{ start: number; end: number }> = [];
-    if (rawOpenTimes.length > 0) {
-      for (const ot of rawOpenTimes) {
-        if (ot.openStartTime && ot.openEndTime) {
-          const s = this.timeToMinutes(ot.openStartTime.slice(0, 5));
-          const e = this.timeToMinutes(ot.openEndTime.slice(0, 5));
-          if (e > s) openWindows.push({ start: s, end: e });
-        }
-      }
-    }
-    if (openWindows.length === 0) {
-      const os = device?.openStart ? this.timeToMinutes(String(device.openStart).slice(0, 5)) : 8 * 60;
-      const oe = device?.openEnd ? this.timeToMinutes(String(device.openEnd).slice(0, 5)) : 22 * 60;
-      if (oe > os) openWindows.push({ start: os, end: oe });
-    }
-
+    const openWindows = this.extractDeviceOpenWindows(device);
+    const openStart = openWindows[0]?.startStr || '08:00';
+    const openEnd = openWindows[openWindows.length - 1]?.endStr || '22:00';
     const minResvTime = Math.max(15, Number(resvRule?.minResvTime || 30));
+    const maxResvTime = Math.max(0, Number(resvRule?.maxResvTime || 0));
     const earliestResvTime = Number(resvRule?.earliestResvTime ?? -1);
     const latestResvTime = Math.max(0, Number(resvRule?.latestResvTime ?? 0));
+    const rule: SeatRuleInfo = {
+      minResvTime,
+      maxResvTime,
+      earliestResvTime,
+      latestResvTime,
+    };
+
+    const unreleasedResult = (reason: string, releaseAt?: string) => ({
+      bookable: false,
+      reason,
+      releaseAt,
+      busySlots: [] as TimeSlot[],
+      freeSlots: [] as TimeSlot[],
+      longestFreeSlot: null,
+      freeRate: 0,
+      status: 'unreleased' as const,
+      openStart,
+      openEnd,
+      openWindows,
+      bookableStart: null,
+      bookableEnd: null,
+      rule,
+    });
+
+    if (diffDays < 0) {
+      return unreleasedResult(`${targetDate} 批次已过期`);
+    }
+
+    // 1. 直接读取 ICSpace 数据包里的 openTimes 与 resvRule（与官方前端 judgeReserve 完全一致）
+    if (device?.openTimes !== undefined && rawOpenTimes.length === 0) {
+      return unreleasedResult(`ICSpace 返回 ${targetDate} 无开放时段（未放座或闭馆）`);
+    }
+    if (device?.resvRule !== undefined && !hasRule) {
+      return unreleasedResult(`ICSpace 返回 ${targetDate} 无可用预约规则（未放座）`);
+    }
+    if (device?.devProp !== undefined && (Number(device.devProp) & 2) === 0) {
+      return unreleasedResult('该座位当前不可预约');
+    }
 
     // 2. 按 ICSpace 实时返回的 resvRule.earliestResvTime 判定目标日期是否已到提前预约窗口
     //    若房间数据包中已存在有效预约记录，说明上游已放座，直接视为已开放
@@ -813,29 +1057,17 @@ export class IcspService {
     if (!hasAnyActiveBookingInRoom && hasRule && earliestResvTime >= 0) {
       if (earliestResvTime === 0 && latestResvTime === 0) {
         if (diffDays > 0) {
-          return {
-            bookable: false,
-            reason: `ICSpace 规则当前仅开放当日（${bj.todayStr}）预约，${targetDate} 尚未放座`,
-            busySlots: [],
-            freeSlots: [],
-            longestFreeSlot: null,
-            freeRate: 0,
-            status: 'unreleased',
-          };
+          return unreleasedResult(
+            `ICSpace 规则当前仅开放当日（${bj.todayStr}）预约，${targetDate} 尚未放座`,
+          );
         }
       } else if (earliestResvTime > 0) {
         if (earliestResvTime % 1440 === 0) {
           const maxDays = earliestResvTime / 1440;
           if (diffDays > maxDays) {
-            return {
-              bookable: false,
-              reason: `ICSpace 规则最多提前 ${maxDays} 天预约，${targetDate} 尚未放座`,
-              busySlots: [],
-              freeSlots: [],
-              longestFreeSlot: null,
-              freeRate: 0,
-              status: 'unreleased',
-            };
+            return unreleasedResult(
+              `ICSpace 规则最多提前 ${maxDays} 天预约，${targetDate} 尚未放座`,
+            );
           }
         } else {
           maxAllowedStartMs = nowMs + earliestResvTime * 60 * 1000;
@@ -845,16 +1077,10 @@ export class IcspService {
             const releaseDateObj = new Date(firstSlotMs - earliestResvTime * 60 * 1000);
             const relBj = this.getBeijingNowInfo(releaseDateObj);
             const releaseAt = `${relBj.todayStr} ${String(relBj.hour).padStart(2, '0')}:${String(relBj.minute).padStart(2, '0')}`;
-            return {
-              bookable: false,
-              reason: `按 ICSpace 实时规则（提前 ${earliestResvTime} 分钟开放），${targetDate} 将于 ${releaseAt} 放座`,
+            return unreleasedResult(
+              `按 ICSpace 实时规则（提前 ${earliestResvTime} 分钟开放），${targetDate} 将于 ${releaseAt} 放座`,
               releaseAt,
-              busySlots: [],
-              freeSlots: [],
-              longestFreeSlot: null,
-              freeRate: 0,
-              status: 'unreleased',
-            };
+            );
           }
         }
       }
@@ -902,7 +1128,9 @@ export class IcspService {
 
     // 若用户所选时段在今日已全部过去，依然保留原始占用条用于展示，但空闲列表为空
     if (allBusySlots.length === 0 && activeRawResv.length > 0) {
-      const fallbackInterval = this.computeSeatIntervals(activeRawResv, 8 * 60, 22 * 60);
+      const firstOpen = openWindows[0]?.start ?? 8 * 60;
+      const lastOpen = openWindows[openWindows.length - 1]?.end ?? 22 * 60;
+      const fallbackInterval = this.computeSeatIntervals(activeRawResv, firstOpen, lastOpen);
       allBusySlots.push(...fallbackInterval.busySlots);
     }
 
@@ -929,6 +1157,12 @@ export class IcspService {
       longestFreeSlot,
       freeRate,
       status,
+      openStart,
+      openEnd,
+      openWindows,
+      bookableStart: allFreeSlots[0]?.startStr ?? null,
+      bookableEnd: allFreeSlots.length > 0 ? allFreeSlots[allFreeSlots.length - 1].endStr : null,
+      rule,
     };
   }
 
@@ -950,7 +1184,8 @@ export class IcspService {
     let effectiveStartMin = reqStartMin;
     let calibrated = false;
     if (targetDate === bj.todayStr) {
-      const minBookableNow = Math.min(22 * 60, bj.currentMin + 2);
+      const upperCap = Math.max(22 * 60, reqEndMin);
+      const minBookableNow = Math.min(upperCap, bj.currentMin + 2);
       if (minBookableNow > effectiveStartMin) {
         effectiveStartMin = minBookableNow;
         calibrated = true;
@@ -1141,7 +1376,7 @@ export class IcspService {
       if (!rawList) {
         const readerUser = this.dbService.db
           .prepare(
-            `SELECT * FROM users WHERE icspace_bound = 1 AND encrypted_cas_password IS NOT NULL ORDER BY updated_at DESC LIMIT 1`,
+            `SELECT * FROM users WHERE icspace_bound = 1 AND (encrypted_cas_tgc IS NOT NULL OR encrypted_cas_password IS NOT NULL) ORDER BY updated_at DESC LIMIT 1`,
           )
           .get() as UserRow | undefined;
 
@@ -1276,6 +1511,12 @@ export class IcspService {
         longestFreeSlot: evaluated.longestFreeSlot,
         freeSlots: evaluated.freeSlots,
         busySlots: evaluated.busySlots,
+        openStart: evaluated.openStart,
+        openEnd: evaluated.openEnd,
+        openWindows: evaluated.openWindows,
+        bookableStart: evaluated.bookableStart,
+        bookableEnd: evaluated.bookableEnd,
+        rule: evaluated.rule,
       };
     });
 
@@ -1324,6 +1565,266 @@ export class IcspService {
       notice: finalNotice,
       summary: this.summarizeSeats(seats),
       seats,
+    };
+  }
+
+  /**
+   * 选中单个座位时实时向 ICSpace 请求该座位的最新开放时段、可约起止时间、预约规则与实时占用。
+   * 优先直查单座接口 devIds={devId}，若上游返回空则自动回退至绕过缓存的实时房间查询定位该座位。
+   */
+  async fetchSeatDetail(
+    user: UserRow | undefined,
+    areaId: string,
+    devId: string,
+    targetDate: string,
+  ): Promise<SeatDetailResponse> {
+    const area = this.getAreaById(areaId);
+    if (!area) {
+      throw new BadRequestException(`未知的图书馆区域 ID: ${areaId}`);
+    }
+
+    const batchStatus = this.getBatchReleaseStatus(targetDate);
+    const fetchedAt = new Date().toISOString();
+
+    if (appConfig.mockMode) {
+      const openStart = area.openTime || '08:00';
+      const openEnd = area.closeTime || '22:00';
+      const calibrated = this.calibrateTimeRange(targetDate, openStart, openEnd);
+      const mockSeats = this.generateMockSeats(
+        area,
+        targetDate,
+        calibrated.effectiveStartTime,
+        calibrated.effectiveEndTime,
+      );
+      const found = mockSeats.find((s) => s.devId === devId) || mockSeats[0];
+      const openStartMin = this.timeToMinutes(openStart);
+      const openEndMin = this.timeToMinutes(openEnd);
+      const openWindows: TimeSlot[] = [
+        {
+          start: openStartMin,
+          end: openEndMin,
+          startStr: openStart,
+          endStr: openEnd,
+          durationMin: openEndMin - openStartMin,
+        },
+      ];
+      const rule: SeatRuleInfo = {
+        minResvTime: 30,
+        maxResvTime: 0,
+        earliestResvTime: 1440,
+        latestResvTime: 0,
+      };
+      const finalSeat: SeatInfo =
+        batchStatus.bookable && calibrated.hasValidWindow
+          ? {
+              ...found,
+              openStart,
+              openEnd,
+              openWindows,
+              bookableStart: found.freeSlots[0]?.startStr ?? null,
+              bookableEnd:
+                found.freeSlots.length > 0
+                  ? found.freeSlots[found.freeSlots.length - 1].endStr
+                  : null,
+              rule,
+            }
+          : {
+              ...found,
+              status: batchStatus.bookable ? 'occupied' : 'unreleased',
+              freeRate: 0,
+              longestFreeSlot: null,
+              freeSlots: [],
+              openStart,
+              openEnd,
+              openWindows,
+              bookableStart: null,
+              bookableEnd: null,
+              rule,
+            };
+
+      return {
+        seat: finalSeat,
+        targetDate,
+        isLive: false,
+        source: 'mock',
+        bookable: batchStatus.bookable,
+        reason: batchStatus.bookable ? undefined : batchStatus.message,
+        releaseAt: batchStatus.releaseAt,
+        openStart,
+        openEnd,
+        openWindows,
+        bookableStart: finalSeat.bookableStart ?? null,
+        bookableEnd: finalSeat.bookableEnd ?? null,
+        rule,
+        fetchedAt,
+      };
+    }
+
+    const compactDate = targetDate.replace(/-/g, '');
+    const cacheKey = `${area.id}:${compactDate}`;
+    const deviceApiUrl = `${appConfig.icspace.host}/ic-web/reserve?devIds=${encodeURIComponent(devId)}&resvDates=${compactDate}&sysKind=8&_=${Date.now()}`;
+    const roomApiUrl = `${appConfig.icspace.host}/ic-web/reserve?roomIds=${encodeURIComponent(area.id)}&resvDates=${compactDate}&sysKind=8&_=${Date.now()}`;
+
+    const extractDeviceFromPayload = (payload: any): any | null => {
+      if (!payload) return null;
+      const list = Array.isArray(payload) ? payload : [payload];
+      return (
+        list.find((d: any) => String(d?.devId) === String(devId)) ||
+        (list.length === 1 && list[0]?.devId !== undefined ? list[0] : null)
+      );
+    };
+
+    const queryWithClient = async (
+      getter: (url: string) => Promise<any>,
+    ): Promise<{ device: any; source: 'device_api' | 'room_api'; roomList?: any[] } | null> => {
+      // 1) 优先直查该座位的单座实时接口 devIds={devId}
+      try {
+        const devResp = await getter(deviceApiUrl);
+        if (devResp?.data?.code === 0 && devResp?.data?.data) {
+          const found = extractDeviceFromPayload(devResp.data.data);
+          if (found) {
+            return { device: found, source: 'device_api' };
+          }
+        }
+      } catch {
+        // fallback to live room query below
+      }
+
+      // 2) 回退至绕过缓存的实时房间查询，精确提取该 devId
+      const roomResp = await getter(roomApiUrl);
+      if (roomResp?.data?.code === 0 && Array.isArray(roomResp?.data?.data)) {
+        const list: any[] = roomResp.data.data;
+        this.areaRawCache.set(cacheKey, { data: list, fetchedAt: Date.now() });
+        const found = extractDeviceFromPayload(list);
+        if (found) {
+          return { device: found, source: 'room_api', roomList: list };
+        }
+      }
+      return null;
+    };
+
+    let matched: { device: any; source: 'device_api' | 'room_api'; roomList?: any[] } | null = null;
+    let lastError: unknown;
+
+    if (user && user.icspace_bound) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const session = await this.ensureUserSession(user, attempt > 0);
+          const client = this.createClientFromCookies(session.cookies);
+          matched = await queryWithClient((url) => client.get(url));
+          if (matched) break;
+          if (attempt === 0) continue;
+        } catch (err: any) {
+          if (err instanceof HttpException) throw err;
+          lastError = err;
+          this.logger.warn(
+            `ICSpace seat detail fetch attempt ${attempt + 1} failed for dev ${devId}: ${err?.message || err}`,
+          );
+          if (attempt === 0) continue;
+        }
+      }
+    } else {
+      // 访客/未绑定用户：先试匿名，再复用任意已绑定只读会话
+      try {
+        matched = await queryWithClient((url) =>
+          axios.get(url, { headers: this.buildHeaders(), timeout: 10000 }),
+        );
+      } catch {
+        // try reader session
+      }
+      if (!matched) {
+        const readerUser = this.dbService.db
+          .prepare(
+            `SELECT * FROM users WHERE icspace_bound = 1 AND (encrypted_cas_tgc IS NOT NULL OR encrypted_cas_password IS NOT NULL) ORDER BY updated_at DESC LIMIT 1`,
+          )
+          .get() as UserRow | undefined;
+        if (readerUser) {
+          for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+              const session = await this.ensureUserSession(readerUser, attempt > 0);
+              const client = this.createClientFromCookies(session.cookies);
+              matched = await queryWithClient((url) => client.get(url));
+              if (matched) break;
+            } catch (err: any) {
+              lastError = err;
+            }
+          }
+        }
+      }
+    }
+
+    if (!matched) {
+      const msg =
+        lastError instanceof Error && lastError.message
+          ? lastError.message
+          : '未能从 ICSpace 拉取到该座位的实时可约时段';
+      if (/密码|身份认证|授权|解密/.test(msg)) {
+        throw new BadRequestException(`图书馆身份校验失败：${msg}`);
+      }
+      throw new ServiceUnavailableException(`实时获取座位详情失败：${msg}`);
+    }
+
+    const { device, source, roomList } = matched;
+    const referenceRoomList = roomList || this.areaRawCache.get(cacheKey)?.data || [device];
+    const hasAnyActiveBookingInRoom = referenceRoomList.some((d: any) =>
+      (Array.isArray(d?.resvInfo) ? d.resvInfo : []).some(
+        (item: any) => (Number(item?.resvStatus || 0) & 128) === 0,
+      ),
+    );
+
+    // 关键：按该座位自己真实的 openStart ~ openEnd 全量评估可约起止时间，不被顶栏筛选时段截断
+    const rawWindows = this.extractDeviceOpenWindows(device);
+    const seatOpenStart = rawWindows[0]?.startStr || area.openTime || '08:00';
+    const seatOpenEnd = rawWindows[rawWindows.length - 1]?.endStr || area.closeTime || '22:00';
+
+    const evaluated = this.evaluateDeviceFromPacket(
+      device,
+      targetDate,
+      seatOpenStart,
+      seatOpenEnd,
+      hasAnyActiveBookingInRoom,
+    );
+
+    const devName = String(device.devName || `${area.name}-${devId}`);
+    const seatNumber = this.extractSeatNumber(devName, 0);
+    const { coordX, coordY } = this.parseSeatCoordinate(device?.coordinate);
+
+    const seat: SeatInfo = {
+      devId: String(device.devId ?? devId),
+      devName,
+      seatNumber,
+      areaId: area.id,
+      areaName: area.name,
+      coordX,
+      coordY,
+      status: evaluated.status,
+      freeRate: evaluated.freeRate,
+      longestFreeSlot: evaluated.longestFreeSlot,
+      freeSlots: evaluated.freeSlots,
+      busySlots: evaluated.busySlots,
+      openStart: evaluated.openStart,
+      openEnd: evaluated.openEnd,
+      openWindows: evaluated.openWindows,
+      bookableStart: evaluated.bookableStart,
+      bookableEnd: evaluated.bookableEnd,
+      rule: evaluated.rule,
+    };
+
+    return {
+      seat,
+      targetDate,
+      isLive: true,
+      source,
+      bookable: evaluated.bookable,
+      reason: evaluated.reason,
+      releaseAt: evaluated.releaseAt,
+      openStart: evaluated.openStart,
+      openEnd: evaluated.openEnd,
+      openWindows: evaluated.openWindows,
+      bookableStart: evaluated.bookableStart,
+      bookableEnd: evaluated.bookableEnd,
+      rule: evaluated.rule,
+      fetchedAt,
     };
   }
 

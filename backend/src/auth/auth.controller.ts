@@ -195,16 +195,22 @@ export class AuthController {
   }
 
   /**
-   * 内网/备选登录提交接口：由服务端安全完成 CAS 协议编码并换取 ST 票据。
+   * 服务端直连 CAS 一键登录接口：
+   * 1) 服务端安全完成 CAS 协议编码并拿到 CASTGC + ST 票据
+   * 2) 校验 ST 并签发本站会话 Cookie
+   * 3) 直接用同一个 CASTGC 免密换取 ICSpace 图书馆预约会话（无需二次输入密码）
    */
   @Post('cas/submit')
   async submitIntranetLogin(
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
     @Body()
     body: {
       token?: string;
       execution?: string;
       username?: string;
       password?: string;
+      rememberForSchedule?: boolean;
       rsa?: string;
       ul?: string | number;
       pl?: string | number;
@@ -227,10 +233,42 @@ export class AuthController {
     if (!result.success) {
       throw new BadRequestException(result.message);
     }
+
+    const validateResult = await this.casService.validateCasTicket(
+      result.data.ticket,
+      result.data.serviceUrl,
+    );
+    if (!validateResult.success) {
+      throw new BadRequestException(validateResult.message);
+    }
+
+    const user = this.casService.upsertUserFromCas(validateResult.data.userInfo);
+
+    // 直接复用本次登录拿到的 CASTGC 换取 ICSpace 会话，免二次输密码
+    const autoRenewPwd =
+      body.rememberForSchedule && body.password ? String(body.password) : undefined;
+    const icspaceRes = result.data.tgcCookie
+      ? await this.icspService.bindUserWithTgc(user, result.data.tgcCookie, autoRenewPwd)
+      : { bound: false, notice: 'CAS 未返回 CASTGC 票据' };
+
+    const freshUser = this.casService.findUserById(user.id) || user;
+    const jwt = signSessionToken({
+      uid: freshUser.id,
+      studentId: freshUser.student_id,
+      casUserId: freshUser.cas_user_id,
+      name: freshUser.name,
+      authProvider: 'dlufl-intranet',
+    });
+    this.setSessionCookie(res, req, jwt);
+
     return {
       success: true,
+      authenticated: true,
       ticket: result.data.ticket,
-      redirectUrl: `/api/auth/cas/callback?ticket=${encodeURIComponent(result.data.ticket)}`,
+      redirectUrl: '/',
+      icspaceAutoBound: icspaceRes.bound,
+      icspaceNotice: icspaceRes.notice || null,
+      user: this.casService.toPublicUser(freshUser),
     };
   }
 

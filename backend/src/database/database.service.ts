@@ -13,6 +13,7 @@ export interface UserRow {
   id_type: string;
   email: string;
   encrypted_cas_password: string | null;
+  encrypted_cas_tgc: string | null;
   icspace_cookies_json: string | null;
   icspace_bound: number;
   login_count: number;
@@ -266,6 +267,7 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
         id_type TEXT NOT NULL DEFAULT '1',
         email TEXT NOT NULL,
         encrypted_cas_password TEXT,
+        encrypted_cas_tgc TEXT,
         icspace_cookies_json TEXT,
         icspace_bound INTEGER NOT NULL DEFAULT 0,
         login_count INTEGER NOT NULL DEFAULT 1,
@@ -369,6 +371,12 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
 
       CREATE INDEX IF NOT EXISTS idx_visit_logs_date ON visit_logs(visit_date);
     `);
+
+    // 兼容存量数据库：自动补齐 encrypted_cas_tgc 列（保存加密后的 CASTGC 票据用于免密换取各平台会话）
+    const userColumns = this.db.prepare(`PRAGMA table_info(users)`).all() as Array<{ name: string }>;
+    if (!userColumns.some((col) => col.name === 'encrypted_cas_tgc')) {
+      this.db.exec(`ALTER TABLE users ADD COLUMN encrypted_cas_tgc TEXT;`);
+    }
 
     const now = new Date().toISOString();
     const upsertMetric = this.db.prepare(
