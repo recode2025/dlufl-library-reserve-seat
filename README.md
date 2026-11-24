@@ -40,32 +40,32 @@ cd ../frontend && npm install
 编辑 [backend/.env](backend/.env)（参考 [backend/.env.example](backend/.env.example)）：
 
 ```env
-PORT=3001
-PUBLIC_BASE_URL=http://localhost:5173
-FRONTEND_URL=http://localhost:5173
+PORT=18301
+PUBLIC_BASE_URL=http://localhost:18517
+FRONTEND_URL=http://localhost:18517
 CAS_SERVER_URL=https://cas.dlufl.edu.cn
 ICSPACE_HOST=https://icspace.dlufl.edu.cn
 # 生产/校园网环境请保持 false；无校园网本地体验界面与抢座流程可设为 true
 ICSPACE_MOCK_MODE=false
 ```
 
-> 生产部署在反向代理（Nginx / Caddy）后时，请将 `PUBLIC_BASE_URL` 和 `FRONTEND_URL` 设为你的外部域名（例如 `https://lib.example.com`），确保 `/cas/login` 与 `/cas/proxyValidate` 使用完全一致的 `service` 回调地址。
+> 生产部署在反向代理（Nginx / Caddy）后时，请将 `PUBLIC_BASE_URL` 和 `FRONTEND_URL` 设为你的外部域名（例如 `https://lib.example.com`），并参考 [deploy/nginx.conf](deploy/nginx.conf) 配置，确保 `/cas/login` 与 `/cas/proxyValidate` 使用完全一致的 `service` 回调地址。
 
 ### 3. 启动开发环境
 
 分别启动后端与前端：
 
 ```bash
-# 终端 1：启动 NestJS 后端（端口 3001）
+# 终端 1：启动 NestJS 后端（端口 18301）
 cd backend
 npm run start:dev
 
-# 终端 2：启动 React 前端（端口 5173，已自动将 /api 代理至 3001 并保留 Host/X-Forwarded-*）
+# 终端 2：启动 React 前端（端口 18517，已自动将 /api 代理至 18301 并保留 Host/X-Forwarded-*）
 cd frontend
 npm run dev
 ```
 
-打开浏览器访问 `http://localhost:5173`。
+打开浏览器访问 `http://localhost:18517`。
 
 ### 4. 使用 PM2 生产托管（推荐）
 

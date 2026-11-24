@@ -4,7 +4,7 @@ import tailwindcss from '@tailwindcss/vite';
 
 const apiProxy = {
   '/api': {
-    target: 'http://127.0.0.1:3001',
+    target: 'http://127.0.0.1:18301',
     changeOrigin: false,
     xfwd: true,
   },
@@ -13,11 +13,11 @@ const apiProxy = {
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
-    port: 5173,
+    port: 18517,
     proxy: apiProxy,
   },
   preview: {
-    port: 5173,
+    port: 18517,
     host: true,
     allowedHosts: true,
     proxy: apiProxy,

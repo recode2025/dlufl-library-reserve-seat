@@ -19,18 +19,18 @@ module.exports = {
       merge_logs: true,
       env: {
         NODE_ENV: 'production',
-        PORT: 3001,
+        PORT: 18301,
       },
       env_production: {
         NODE_ENV: 'production',
-        PORT: 3001,
+        PORT: 18301,
       },
     },
     {
       name: 'dlufl-library-frontend',
       cwd: path.resolve(__dirname, 'frontend'),
       script: path.resolve(__dirname, 'frontend/node_modules/vite/bin/vite.js'),
-      args: 'preview --host 0.0.0.0 --port 5173 --strictPort',
+      args: 'preview --host 127.0.0.1 --port 18517 --strictPort',
       instances: 1,
       exec_mode: 'fork',
       autorestart: true,
@@ -42,9 +42,13 @@ module.exports = {
       merge_logs: true,
       env: {
         NODE_ENV: 'production',
+        BACKEND_PORT: 18301,
+        FRONTEND_PORT: 18517,
       },
       env_production: {
         NODE_ENV: 'production',
+        BACKEND_PORT: 18301,
+        FRONTEND_PORT: 18517,
       },
     },
   ],
