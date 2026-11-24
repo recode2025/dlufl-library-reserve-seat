@@ -24,6 +24,7 @@ import type {
   SeatsResponse,
   UserProfile,
 } from '../types';
+import { SeatFloorMap } from './SeatFloorMap';
 
 interface SeatSelectorProps {
   areas: LibraryArea[];
@@ -76,7 +77,6 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
   // 视图模式：真实坐标平面位置图 / 网格列表
   const [viewMode, setViewMode] = useState<'map' | 'grid'>('map');
   const [mapZoom, setMapZoom] = useState<number>(1);
-  const [floorPlanImgOk, setFloorPlanImgOk] = useState(true);
 
   const [data, setData] = useState<SeatsResponse | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -106,9 +106,13 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
   }, [initialAreaId]);
 
   useEffect(() => {
-    setFloorPlanImgOk(true);
     setMapZoom(1);
   }, [areaId]);
+
+  const handleSelectSeatFromMap = useCallback((seat: SeatInfo) => {
+    setSelectedSeat(seat);
+    setFeedback(null);
+  }, []);
 
   const loadSeats = useCallback(async (): Promise<SeatsResponse | null> => {
     const seq = ++reqSeqRef.current;
@@ -805,82 +809,17 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
                 : '当前暂未加载到座位数据，请确认已完成授权或稍后刷新。'}
             </div>
           ) : effectiveViewMode === 'map' ? (
-            /* 真实对应位置平面座位图 */
-            <div className="overflow-auto rounded-xl border border-[#DCE4EE] bg-[#F8FAFC]">
-              <div
-                style={{
-                  width: `${Math.round(mapZoom * 100)}%`,
-                  minWidth: '640px',
-                }}
-                className="relative mx-auto select-none"
-              >
-                {data?.floorPlanUrl && floorPlanImgOk ? (
-                  <img
-                    src={data.floorPlanUrl}
-                    alt={`${data.area.name} 平面座位图`}
-                    draggable={false}
-                    onError={() => setFloorPlanImgOk(false)}
-                    className="block h-auto w-full"
-                  />
-                ) : (
-                  <div
-                    className="aspect-[16/10] w-full"
-                    style={{
-                      backgroundImage:
-                        'radial-gradient(circle, #cbd5e1 1px, transparent 1px)',
-                      backgroundSize: '20px 20px',
-                    }}
-                  />
-                )}
-
-                {(data?.seats || []).map((seat) => {
-                  if (seat.coordX === null || seat.coordY === null) return null;
-                  const isSelected = selectedSeat?.devId === seat.devId;
-                  const isMatched = matchedSeatIds.has(seat.devId);
-
-                  const dotClass =
-                    seat.status === 'free'
-                      ? 'border-emerald-600 bg-emerald-500 text-white hover:bg-emerald-600'
-                      : seat.status === 'partial'
-                        ? 'border-amber-600 bg-amber-400 text-[#0D223D] hover:bg-amber-500'
-                        : seat.status === 'unreleased'
-                          ? 'border-dashed border-slate-400 bg-slate-200/90 text-slate-600'
-                          : 'border-slate-400 bg-slate-300/90 text-slate-600';
-
-                  return (
-                    <button
-                      key={seat.devId}
-                      type="button"
-                      onClick={() => {
-                        setSelectedSeat(seat);
-                        setFeedback(null);
-                      }}
-                      title={`${seat.devName} · ${
-                        seat.status === 'free'
-                          ? '全时段可约'
-                          : seat.status === 'partial'
-                            ? `部分时段可约 (${seat.longestFreeSlot?.startStr}-${seat.longestFreeSlot?.endStr})`
-                            : seat.status === 'unreleased'
-                              ? '未放座'
-                              : '已满'
-                      }`}
-                      style={{
-                        left: `${seat.coordX}%`,
-                        top: `${seat.coordY}%`,
-                        transform: 'translate(-50%, -50%)',
-                      }}
-                      className={`absolute flex h-5 min-w-5 items-center justify-center rounded-full border px-1 font-mono text-[9px] font-bold leading-none shadow-sm transition-transform hover:z-20 hover:scale-125 ${dotClass} ${
-                        isSelected
-                          ? 'z-30 scale-125 ring-2 ring-[#0D386B] ring-offset-1'
-                          : 'z-10'
-                      } ${isMatched ? 'opacity-100' : 'opacity-20'}`}
-                    >
-                      {seat.seatNumber}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
+            /* 真实对应位置平面座位图（独立 memo 渲染 + 客户端 Blob 缓存 + 后台预热） */
+            <SeatFloorMap
+              areaName={data?.area.name || '阅览区'}
+              floorPlanUrl={data?.floorPlanUrl || null}
+              areas={areas}
+              seats={data?.seats || []}
+              matchedSeatIds={matchedSeatIds}
+              selectedDevId={selectedSeat?.devId || null}
+              mapZoom={mapZoom}
+              onSelectSeat={handleSelectSeatFromMap}
+            />
           ) : filteredSeats.length === 0 ? (
             <div className="rounded-xl border border-dashed border-[#CBD5E1] bg-[#F8FAFC] py-14 text-center text-sm text-[#4D627A]">
               当前筛选条件下没有可显示的座位，可切换筛选或开启上方「服务端轮询找座」。

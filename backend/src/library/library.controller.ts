@@ -47,8 +47,12 @@ export class LibraryController {
     if (!img) {
       throw new NotFoundException('暂未获取到该区域平面底图');
     }
+    res.setHeader('ETag', img.etag);
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    if (req.headers['if-none-match'] === img.etag) {
+      return res.status(304).end();
+    }
     res.setHeader('Content-Type', img.contentType);
-    res.setHeader('Cache-Control', 'public, max-age=3600');
     return res.send(img.buffer);
   }
 

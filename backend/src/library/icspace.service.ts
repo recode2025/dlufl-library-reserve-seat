@@ -1,5 +1,8 @@
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import axios, { AxiosInstance } from 'axios';
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 import { Cookie, CookieJar } from 'tough-cookie';
 import { wrapper } from 'axios-cookiejar-support';
 import * as cheerio from 'cheerio';
@@ -61,10 +64,14 @@ export class IcspService {
   // 上游房间座位快照 3 秒合并缓存：多用户同时刷新/轮询同一区域时，每 3 秒最多向上游 ICSpace 发起 1 次请求，防限流封禁
   private readonly areaRawCache = new Map<string, { data: any[]; fetchedAt: number }>();
   private readonly AREA_CACHE_TTL_MS = 3000;
-  // 区域平面底图缓存（12 小时有效）
+  // 区域平面底图内存 + 本地磁盘缓存（12 小时有效）及并发请求合并
   private readonly floorPlanCache = new Map<
     string,
-    { buffer: Buffer; contentType: string; fetchedAt: number }
+    { buffer: Buffer; contentType: string; etag: string; fetchedAt: number }
+  >();
+  private readonly floorPlanInFlight = new Map<
+    string,
+    Promise<{ buffer: Buffer; contentType: string; etag: string } | null>
   >();
   private readonly FLOOR_PLAN_TTL_MS = 12 * 60 * 60 * 1000;
 
@@ -258,11 +265,30 @@ export class IcspService {
       .run(encPwd, encSession, now, user.id);
 
     this.sessionCache.set(user.id, session);
+    // 后台异步预热 4 个区域的平面底图到本地缓存，切换区域秒开
+    void this.prewarmFloorPlans(user);
     return {
       accNo: session.accNo,
       trueName: session.trueName || user.name,
       pid: session.pid || user.student_id,
     };
+  }
+
+  private getFloorPlanDiskPaths(areaId: string) {
+    const safeId = areaId.replace(/[^a-zA-Z0-9_-]/g, '');
+    const dir = path.join(path.dirname(appConfig.databasePath), 'floorplans');
+    return {
+      dir,
+      binPath: path.join(dir, `${safeId}.bin`),
+      metaPath: path.join(dir, `${safeId}.json`),
+    };
+  }
+
+  async prewarmFloorPlans(user: UserRow) {
+    if (appConfig.mockMode) return;
+    await Promise.allSettled(
+      LIBRARY_AREAS.map((area) => this.getAreaFloorPlanImage(user, area.id)),
+    );
   }
 
   markMockBound(userId: number) {
@@ -412,56 +438,113 @@ export class IcspService {
   }
 
   /**
-   * 代理拉取 ICSpace 官方区域平面底图（GET /ic-web/sysInfo?sysType=2&sysValue=roomId&sysKind=16 -> content）
+   * 代理拉取 ICSpace 官方区域平面底图（内存 + 磁盘持久化缓存 + ETag + 并发去重）
    */
   async getAreaFloorPlanImage(
     user: UserRow | undefined,
     areaId: string,
-  ): Promise<{ buffer: Buffer; contentType: string } | null> {
+  ): Promise<{ buffer: Buffer; contentType: string; etag: string } | null> {
+    const now = Date.now();
     const cached = this.floorPlanCache.get(areaId);
-    if (cached && Date.now() - cached.fetchedAt < this.FLOOR_PLAN_TTL_MS) {
-      return { buffer: cached.buffer, contentType: cached.contentType };
+    if (cached && now - cached.fetchedAt < this.FLOOR_PLAN_TTL_MS) {
+      return { buffer: cached.buffer, contentType: cached.contentType, etag: cached.etag };
     }
 
     if (appConfig.mockMode) return null;
 
-    let sessionUser: UserRow | undefined = user && user.icspace_bound ? user : undefined;
-    if (!sessionUser) {
-      sessionUser = this.dbService.db
-        .prepare(
-          `SELECT * FROM users WHERE icspace_bound = 1 AND encrypted_cas_password IS NOT NULL ORDER BY updated_at DESC LIMIT 1`,
-        )
-        .get() as UserRow | undefined;
-    }
-    if (!sessionUser) return null;
-
-    for (let attempt = 0; attempt < 2; attempt++) {
+    // 尝试读取本地磁盘缓存（PM2 重启后依然毫秒级直出）
+    if (appConfig.databasePath !== ':memory:') {
       try {
-        const session = await this.ensureUserSession(sessionUser, attempt > 0);
-        const client = this.createClientFromCookies(session.cookies);
-        const infoUrl = `${appConfig.icspace.host}/ic-web/sysInfo?sysType=2&sysValue=${encodeURIComponent(areaId)}&sysKind=16`;
-        const infoResp = await client.get(infoUrl);
-        if (infoResp.data?.code !== 0) {
-          if (attempt === 0) continue;
-          return null;
+        const { binPath, metaPath } = this.getFloorPlanDiskPaths(areaId);
+        if (fs.existsSync(binPath) && fs.existsSync(metaPath)) {
+          const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')) as {
+            contentType: string;
+            etag: string;
+            fetchedAt: number;
+          };
+          if (now - meta.fetchedAt < this.FLOOR_PLAN_TTL_MS) {
+            const buffer = fs.readFileSync(binPath);
+            this.floorPlanCache.set(areaId, {
+              buffer,
+              contentType: meta.contentType,
+              etag: meta.etag,
+              fetchedAt: meta.fetchedAt,
+            });
+            return { buffer, contentType: meta.contentType, etag: meta.etag };
+          }
         }
-        const content = String(infoResp.data?.data?.content || '').trim();
-        if (!content) return null;
-
-        const imgUrl = content.startsWith('http')
-          ? content
-          : `${appConfig.icspace.host}/${content.replace(/^\/+/, '')}`;
-        const imgResp = await client.get(imgUrl, { responseType: 'arraybuffer', timeout: 15000 });
-        const buffer = Buffer.from(imgResp.data);
-        const contentType = String(imgResp.headers['content-type'] || 'image/png');
-        this.floorPlanCache.set(areaId, { buffer, contentType, fetchedAt: Date.now() });
-        return { buffer, contentType };
-      } catch (e: any) {
-        if (attempt === 0) continue;
-        this.logger.warn(`Failed to fetch floor plan for area ${areaId}: ${e?.message}`);
+      } catch {
+        // ignore broken disk cache
       }
     }
-    return null;
+
+    // 合并同区域的并发拉取请求
+    const existingFlight = this.floorPlanInFlight.get(areaId);
+    if (existingFlight) {
+      return existingFlight;
+    }
+
+    const flight = (async () => {
+      let sessionUser: UserRow | undefined = user && user.icspace_bound ? user : undefined;
+      if (!sessionUser) {
+        sessionUser = this.dbService.db
+          .prepare(
+            `SELECT * FROM users WHERE icspace_bound = 1 AND encrypted_cas_password IS NOT NULL ORDER BY updated_at DESC LIMIT 1`,
+          )
+          .get() as UserRow | undefined;
+      }
+      if (!sessionUser) return null;
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const session = await this.ensureUserSession(sessionUser, attempt > 0);
+          const client = this.createClientFromCookies(session.cookies);
+          const infoUrl = `${appConfig.icspace.host}/ic-web/sysInfo?sysType=2&sysValue=${encodeURIComponent(areaId)}&sysKind=16`;
+          const infoResp = await client.get(infoUrl);
+          if (infoResp.data?.code !== 0) {
+            if (attempt === 0) continue;
+            return null;
+          }
+          const content = String(infoResp.data?.data?.content || '').trim();
+          if (!content) return null;
+
+          const imgUrl = content.startsWith('http')
+            ? content
+            : `${appConfig.icspace.host}/${content.replace(/^\/+/, '')}`;
+          const imgResp = await client.get(imgUrl, { responseType: 'arraybuffer', timeout: 15000 });
+          const buffer = Buffer.from(imgResp.data);
+          const contentType = String(imgResp.headers['content-type'] || 'image/png');
+          const etag = `"fp-${crypto.createHash('md5').update(buffer).digest('hex').slice(0, 16)}"`;
+          const fetchedAt = Date.now();
+
+          this.floorPlanCache.set(areaId, { buffer, contentType, etag, fetchedAt });
+
+          if (appConfig.databasePath !== ':memory:') {
+            try {
+              const { dir, binPath, metaPath } = this.getFloorPlanDiskPaths(areaId);
+              fs.mkdirSync(dir, { recursive: true });
+              fs.writeFileSync(binPath, buffer);
+              fs.writeFileSync(metaPath, JSON.stringify({ contentType, etag, fetchedAt }));
+            } catch {
+              // non-fatal disk cache failure
+            }
+          }
+
+          return { buffer, contentType, etag };
+        } catch (e: any) {
+          if (attempt === 0) continue;
+          this.logger.warn(`Failed to fetch floor plan for area ${areaId}: ${e?.message}`);
+        }
+      }
+      return null;
+    })();
+
+    this.floorPlanInFlight.set(areaId, flight);
+    try {
+      return await flight;
+    } finally {
+      this.floorPlanInFlight.delete(areaId);
+    }
   }
 
   private extractSeatNumber(devName: string, fallbackIndex: number): number {
