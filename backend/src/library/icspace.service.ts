@@ -495,16 +495,254 @@ export class IcspService {
       day: '2-digit',
       hour: '2-digit',
       minute: '2-digit',
-      hour12: false,
+      hourCycle: 'h23',
     }).formatToParts(now);
 
     const get = (type: string) => bjParts.find((p) => p.type === type)?.value || '00';
+    const hour = Number(get('hour')) % 24;
+    const minute = Number(get('minute'));
     return {
       year: Number(get('year')),
       month: Number(get('month')),
       day: Number(get('day')),
+      hour,
+      minute,
       todayStr: `${get('year')}-${get('month')}-${get('day')}`,
-      currentMin: Number(get('hour')) * 60 + Number(get('minute')),
+      currentMin: hour * 60 + minute,
+    };
+  }
+
+  private toBeijingTimestamp(dateStr: string, timeStr: string): number {
+    const normalized = timeStr.length === 5 ? `${timeStr}:00` : timeStr;
+    return new Date(`${dateStr}T${normalized}+08:00`).getTime();
+  }
+
+  /**
+   * 依据实时抓取的 ICSpace 上游数据包（openTimes / resvRule / resvInfo）判断某日期与座位是否已开放预约，
+   * 不再凭本地时间硬猜（彻底杜绝 00:xx 误判或图书馆临时调整放座时间导致的错判）。
+   */
+  evaluateDeviceFromPacket(
+    device: any,
+    targetDate: string,
+    requestedStart: string,
+    requestedEnd: string,
+    hasAnyActiveBookingInRoom: boolean,
+    now = new Date(),
+  ): {
+    bookable: boolean;
+    reason?: string;
+    releaseAt?: string;
+    busySlots: TimeSlot[];
+    freeSlots: TimeSlot[];
+    longestFreeSlot: TimeSlot | null;
+    freeRate: number;
+    status: SeatInfo['status'];
+  } {
+    const bj = this.getBeijingNowInfo(now);
+    const todayUtc = Date.UTC(bj.year, bj.month - 1, bj.day);
+    const [ty, tm, td] = targetDate.split('-').map(Number);
+    const targetUtc = Date.UTC(ty, tm - 1, td);
+    const diffDays = Math.round((targetUtc - todayUtc) / (24 * 60 * 60 * 1000));
+
+    if (diffDays < 0) {
+      return {
+        bookable: false,
+        reason: `${targetDate} 批次已过期`,
+        busySlots: [],
+        freeSlots: [],
+        longestFreeSlot: null,
+        freeRate: 0,
+        status: 'unreleased',
+      };
+    }
+
+    const resvRule = device?.resvRule && typeof device.resvRule === 'object' ? device.resvRule : null;
+    const hasRule = Boolean(resvRule && Object.keys(resvRule).length > 0);
+    const rawOpenTimes: Array<{ openStartTime?: string; openEndTime?: string }> = Array.isArray(
+      device?.openTimes,
+    )
+      ? device.openTimes
+      : [];
+
+    // 1. 直接读取 ICSpace 数据包里的 openTimes 与 resvRule（与官方前端 judgeReserve 完全一致）
+    if (device?.openTimes !== undefined && rawOpenTimes.length === 0) {
+      return {
+        bookable: false,
+        reason: `ICSpace 返回 ${targetDate} 无开放时段（未放座或闭馆）`,
+        busySlots: [],
+        freeSlots: [],
+        longestFreeSlot: null,
+        freeRate: 0,
+        status: 'unreleased',
+      };
+    }
+    if (device?.resvRule !== undefined && !hasRule) {
+      return {
+        bookable: false,
+        reason: `ICSpace 返回 ${targetDate} 无可用预约规则（未放座）`,
+        busySlots: [],
+        freeSlots: [],
+        longestFreeSlot: null,
+        freeRate: 0,
+        status: 'unreleased',
+      };
+    }
+    if (device?.devProp !== undefined && (Number(device.devProp) & 2) === 0) {
+      return {
+        bookable: false,
+        reason: '该座位当前不可预约',
+        busySlots: [],
+        freeSlots: [],
+        longestFreeSlot: null,
+        freeRate: 0,
+        status: 'unreleased',
+      };
+    }
+
+    // 确定该日期的实际开放起止时间（优先取 ICSpace 实时返回的 openTimes / openStart / openEnd）
+    const openWindows: Array<{ start: number; end: number }> = [];
+    if (rawOpenTimes.length > 0) {
+      for (const ot of rawOpenTimes) {
+        if (ot.openStartTime && ot.openEndTime) {
+          const s = this.timeToMinutes(ot.openStartTime.slice(0, 5));
+          const e = this.timeToMinutes(ot.openEndTime.slice(0, 5));
+          if (e > s) openWindows.push({ start: s, end: e });
+        }
+      }
+    }
+    if (openWindows.length === 0) {
+      const os = device?.openStart ? this.timeToMinutes(String(device.openStart).slice(0, 5)) : 8 * 60;
+      const oe = device?.openEnd ? this.timeToMinutes(String(device.openEnd).slice(0, 5)) : 22 * 60;
+      if (oe > os) openWindows.push({ start: os, end: oe });
+    }
+
+    const minResvTime = Math.max(15, Number(resvRule?.minResvTime || 30));
+    const earliestResvTime = Number(resvRule?.earliestResvTime ?? -1);
+    const latestResvTime = Math.max(0, Number(resvRule?.latestResvTime ?? 0));
+
+    // 2. 按 ICSpace 实时返回的 resvRule.earliestResvTime 判定目标日期是否已到提前预约窗口
+    //    若房间数据包中已存在有效预约记录，说明上游已放座，直接视为已开放
+    const nowMs = now.getTime();
+    let maxAllowedStartMs = Number.POSITIVE_INFINITY;
+    if (!hasAnyActiveBookingInRoom && hasRule && earliestResvTime >= 0) {
+      if (earliestResvTime === 0 && latestResvTime === 0) {
+        if (diffDays > 0) {
+          return {
+            bookable: false,
+            reason: `ICSpace 规则当前仅开放当日（${bj.todayStr}）预约，${targetDate} 尚未放座`,
+            busySlots: [],
+            freeSlots: [],
+            longestFreeSlot: null,
+            freeRate: 0,
+            status: 'unreleased',
+          };
+        }
+      } else if (earliestResvTime > 0) {
+        if (earliestResvTime % 1440 === 0) {
+          const maxDays = earliestResvTime / 1440;
+          if (diffDays > maxDays) {
+            return {
+              bookable: false,
+              reason: `ICSpace 规则最多提前 ${maxDays} 天预约，${targetDate} 尚未放座`,
+              busySlots: [],
+              freeSlots: [],
+              longestFreeSlot: null,
+              freeRate: 0,
+              status: 'unreleased',
+            };
+          }
+        } else {
+          maxAllowedStartMs = nowMs + earliestResvTime * 60 * 1000;
+          const firstOpenStart = openWindows[0]?.start ?? 8 * 60;
+          const firstSlotMs = this.toBeijingTimestamp(targetDate, this.minutesToTime(firstOpenStart));
+          if (firstSlotMs > maxAllowedStartMs) {
+            const releaseDateObj = new Date(firstSlotMs - earliestResvTime * 60 * 1000);
+            const relBj = this.getBeijingNowInfo(releaseDateObj);
+            const releaseAt = `${relBj.todayStr} ${String(relBj.hour).padStart(2, '0')}:${String(relBj.minute).padStart(2, '0')}`;
+            return {
+              bookable: false,
+              reason: `按 ICSpace 实时规则（提前 ${earliestResvTime} 分钟开放），${targetDate} 将于 ${releaseAt} 放座`,
+              releaseAt,
+              busySlots: [],
+              freeSlots: [],
+              longestFreeSlot: null,
+              freeRate: 0,
+              status: 'unreleased',
+            };
+          }
+        }
+      }
+    }
+
+    // 3. 计算有效可约时段（与用户选择时段、ICSpace 实时开放时段、以及今日当前北京时间校准取交集）
+    const calibrated = this.calibrateTimeRange(targetDate, requestedStart, requestedEnd, now);
+    const reqStartMin = calibrated.effectiveStartMin;
+    const reqEndMin = calibrated.effectiveEndMin;
+
+    // 过滤掉 ICSpace 已取消/失效的预约记录（官方文档与前端逻辑：!(128 & resvStatus)）
+    const activeRawResv = (Array.isArray(device?.resvInfo) ? device.resvInfo : []).filter(
+      (item: any) => (Number(item?.resvStatus || 0) & 128) === 0,
+    );
+
+    const allBusySlots: TimeSlot[] = [];
+    const allFreeSlots: TimeSlot[] = [];
+
+    for (const win of openWindows) {
+      let winStart = Math.max(win.start, reqStartMin);
+      let winEnd = Math.min(win.end, reqEndMin);
+
+      // 若是精确分钟提前窗口（earliestResvTime % 1440 !== 0），截断超过最大允许开始时间的边界
+      if (Number.isFinite(maxAllowedStartMs)) {
+        const winStartMs = this.toBeijingTimestamp(targetDate, this.minutesToTime(winStart));
+        if (winStartMs > maxAllowedStartMs) continue;
+      }
+
+      // 应用 latestResvTime（今日最短提前时间）
+      if (diffDays === 0 && latestResvTime > 0) {
+        const minAllowedToday = bj.currentMin + latestResvTime;
+        winStart = Math.max(winStart, minAllowedToday);
+      }
+
+      if (winEnd - winStart < minResvTime) continue;
+
+      const { busySlots, freeSlots } = this.computeSeatIntervals(activeRawResv, winStart, winEnd);
+      if (allBusySlots.length === 0) allBusySlots.push(...busySlots);
+      for (const fs of freeSlots) {
+        if (fs.durationMin >= minResvTime) {
+          allFreeSlots.push(fs);
+        }
+      }
+    }
+
+    // 若用户所选时段在今日已全部过去，依然保留原始占用条用于展示，但空闲列表为空
+    if (allBusySlots.length === 0 && activeRawResv.length > 0) {
+      const fallbackInterval = this.computeSeatIntervals(activeRawResv, 8 * 60, 22 * 60);
+      allBusySlots.push(...fallbackInterval.busySlots);
+    }
+
+    let longestFreeSlot: TimeSlot | null = null;
+    for (const slot of allFreeSlots) {
+      if (!longestFreeSlot || slot.durationMin > longestFreeSlot.durationMin) {
+        longestFreeSlot = slot;
+      }
+    }
+
+    const totalRange = Math.max(1, reqEndMin - reqStartMin);
+    const freeRate = longestFreeSlot
+      ? Math.min(100, Math.round((longestFreeSlot.durationMin / totalRange) * 100))
+      : 0;
+
+    let status: SeatInfo['status'] = 'occupied';
+    if (longestFreeSlot && freeRate >= 98) status = 'free';
+    else if (longestFreeSlot && longestFreeSlot.durationMin >= minResvTime) status = 'partial';
+
+    return {
+      bookable: true,
+      busySlots: allBusySlots,
+      freeSlots: allFreeSlots,
+      longestFreeSlot,
+      freeRate,
+      status,
     };
   }
 
@@ -778,53 +1016,31 @@ export class IcspService {
       }
     }
 
+    const hasAnyActiveBookingInRoom = (rawList || []).some((device: any) =>
+      (Array.isArray(device?.resvInfo) ? device.resvInfo : []).some(
+        (item: any) => (Number(item?.resvStatus || 0) & 128) === 0,
+      ),
+    );
+
+    let packetUnreleasedReason: string | undefined;
+    let packetReleaseAt: string | undefined;
+
     const seats: SeatInfo[] = (rawList || []).map((device: any, idx: number) => {
       const devName = String(device.devName || `${area.name}-${idx + 1}`);
       const seatNumber = this.extractSeatNumber(devName, idx);
 
-      // 批次尚未到 18:00 放座时间，或 ICSpace 明确返回未开放时段（openList 为空 / openStart 为空）
-      const explicitClosedByRemote =
-        (Array.isArray(device.openList) && device.openList.length === 0) ||
-        device.openStart === '' ||
-        device.openStart === null ||
-        device.resvStatus === 0;
+      const evaluated = this.evaluateDeviceFromPacket(
+        device,
+        targetDate,
+        startTime,
+        endTime,
+        hasAnyActiveBookingInRoom,
+      );
 
-      if (!batchStatus.bookable || explicitClosedByRemote) {
-        return {
-          devId: String(device.devId),
-          devName,
-          seatNumber,
-          areaId: area.id,
-          areaName: area.name,
-          status: 'unreleased' as const,
-          freeRate: 0,
-          longestFreeSlot: null,
-          freeSlots: [],
-          busySlots: [],
-        };
+      if (!evaluated.bookable && !packetUnreleasedReason) {
+        packetUnreleasedReason = evaluated.reason;
+        packetReleaseAt = evaluated.releaseAt;
       }
-
-      if (!calibratedRange.hasValidWindow) {
-        return {
-          devId: String(device.devId),
-          devName,
-          seatNumber,
-          areaId: area.id,
-          areaName: area.name,
-          status: 'occupied' as const,
-          freeRate: 0,
-          longestFreeSlot: null,
-          freeSlots: [],
-          busySlots: [],
-        };
-      }
-
-      const { busySlots, freeSlots, longestFreeSlot, freeRate } =
-        this.computeSeatIntervals(device.resvInfo || [], startMin, endMin);
-
-      let status: SeatInfo['status'] = 'occupied';
-      if (freeRate >= 98) status = 'free';
-      else if (longestFreeSlot && longestFreeSlot.durationMin >= 30) status = 'partial';
 
       return {
         devId: String(device.devId),
@@ -832,28 +1048,37 @@ export class IcspService {
         seatNumber,
         areaId: area.id,
         areaName: area.name,
-        status,
-        freeRate,
-        longestFreeSlot,
-        freeSlots,
-        busySlots,
+        status: evaluated.status,
+        freeRate: evaluated.freeRate,
+        longestFreeSlot: evaluated.longestFreeSlot,
+        freeSlots: evaluated.freeSlots,
+        busySlots: evaluated.busySlots,
       };
     });
 
     seats.sort((a, b) => a.seatNumber - b.seatNumber);
 
-    const effectiveBatchStatus: BatchReleaseStatus =
-      batchStatus.bookable && seats.length > 0 && seats.every((s) => s.status === 'unreleased')
-        ? {
-            state: 'unreleased',
-            bookable: false,
-            message: `${targetDate} 该区域当前未开放预约时段（ICSpace 返回无开放窗口）。`,
-          }
-        : batchStatus;
+    const allUnreleased = seats.length > 0 && seats.every((s) => s.status === 'unreleased');
+    const effectiveBatchStatus: BatchReleaseStatus = allUnreleased
+      ? {
+          state: 'unreleased',
+          bookable: false,
+          releaseAt: packetReleaseAt,
+          message:
+            packetUnreleasedReason ||
+            `ICSpace 实时数据显示 ${targetDate} 批次尚未开放预约。`,
+        }
+      : {
+          state: 'open',
+          bookable: true,
+          message: `${targetDate} 批次已开放预约（依据 ICSpace 实时数据包判定）。`,
+        };
 
     let finalNotice: string | undefined;
     if (!effectiveBatchStatus.bookable) {
       finalNotice = effectiveBatchStatus.message;
+    } else if (!calibratedRange.hasValidWindow) {
+      finalNotice = '当前所选结束时间距现在不足 30 分钟，请调晚结束时间或切换至已开放的次日批次。';
     } else if (isGuestPreview) {
       finalNotice = !user
         ? '当前为未登录实时查座模式，支持 AJAX 自动刷新；登录后即可一键预约或配置 18:01 自动抢座。'

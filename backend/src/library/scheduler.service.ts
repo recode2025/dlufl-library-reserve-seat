@@ -72,7 +72,7 @@ export class SchedulerService implements OnModuleInit {
       minute: '2-digit',
       second: '2-digit',
       weekday: 'short',
-      hour12: false,
+      hourCycle: 'h23',
     }).formatToParts(date);
     const get = (t: string) => parts.find((p) => p.type === t)?.value || '00';
     const weekdayMap: Record<string, number> = {
@@ -88,7 +88,7 @@ export class SchedulerService implements OnModuleInit {
       year: Number(get('year')),
       month: Number(get('month')),
       day: Number(get('day')),
-      hour: Number(get('hour')),
+      hour: Number(get('hour')) % 24,
       minute: Number(get('minute')),
       second: Number(get('second')),
       weekday: weekdayMap[get('weekday')] ?? date.getDay(),

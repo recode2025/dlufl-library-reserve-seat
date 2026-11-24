@@ -147,6 +147,73 @@ describe('DLUFL Library System Core Flows', () => {
     const freeSeat = seatsRes.seats.find((s) => s.status === 'free');
     assert.ok(freeSeat, 'Expected at least one free seat in mock mode');
 
+    // 验证 00:42 凌晨时钟不出现 24:42 误判，且完全按 ICSpace 实时数据包判定放座批次
+    const midnightNow = new Date('2026-11-25T00:42:00+08:00');
+    assert.equal(icspService.getBatchReleaseStatus('2026-11-25', midnightNow).state, 'open');
+    assert.equal(icspService.getBatchReleaseStatus('2026-11-26', midnightNow).state, 'unreleased');
+
+    // 实时数据包测试 1：当日 00:42，ICSpace 返回 openTimes + earliestResvTime=840（提前14小时，即前晚18:00放次日08:00）
+    const todayPacket = icspService.evaluateDeviceFromPacket(
+      {
+        devId: 1,
+        devName: '2M-001',
+        devProp: 2,
+        openStart: '08:00',
+        openEnd: '22:00',
+        openTimes: [{ openStartTime: '08:00', openEndTime: '22:00' }],
+        resvRule: { earliestResvTime: 840, latestResvTime: 0, minResvTime: 30, maxResvTime: 840 },
+        resvInfo: [],
+      },
+      '2026-11-25',
+      '08:30',
+      '22:00',
+      true,
+      midnightNow,
+    );
+    assert.equal(todayPacket.bookable, true);
+    assert.equal(todayPacket.status, 'free');
+
+    // 实时数据包测试 2：次日 2026-11-26 在 00:42 尚未放座（openTimes 为空 或 超出 earliestResvTime=840）
+    const tomorrowPacket = icspService.evaluateDeviceFromPacket(
+      {
+        devId: 1,
+        devName: '2M-001',
+        devProp: 2,
+        openStart: '08:00',
+        openEnd: '22:00',
+        openTimes: [{ openStartTime: '08:00', openEndTime: '22:00' }],
+        resvRule: { earliestResvTime: 840, latestResvTime: 0, minResvTime: 30, maxResvTime: 840 },
+        resvInfo: [],
+      },
+      '2026-11-26',
+      '08:30',
+      '22:00',
+      false,
+      midnightNow,
+    );
+    assert.equal(tomorrowPacket.bookable, false);
+    assert.equal(tomorrowPacket.status, 'unreleased');
+    assert.equal(tomorrowPacket.releaseAt, '2026-11-25 18:00');
+
+    // 实时数据包测试 3：openTimes=[] 时无论时间如何，直接判定未放座
+    const closedPacket = icspService.evaluateDeviceFromPacket(
+      {
+        devId: 1,
+        devName: '2M-001',
+        devProp: 2,
+        openTimes: [],
+        resvRule: { earliestResvTime: 1440, latestResvTime: 0 },
+        resvInfo: [],
+      },
+      '2026-11-26',
+      '08:30',
+      '22:00',
+      false,
+      new Date('2026-11-25T19:00:00+08:00'),
+    );
+    assert.equal(closedPacket.bookable, false);
+    assert.equal(closedPacket.status, 'unreleased');
+
     // 验证可约时间校准：若当前北京时间 14:20 已在空闲区间 [08:30, 22:00] 中途，应自动校准为 14:22-22:00 且仍可预约
     const midDayNow = new Date(`${todayDate}T14:20:00+08:00`);
     const cal = icspService.calibrateTimeRange(todayDate, '08:30', '22:00', midDayNow);
