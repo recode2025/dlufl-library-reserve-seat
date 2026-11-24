@@ -4,14 +4,17 @@ import {
   Controller,
   Delete,
   Get,
+  NotFoundException,
   Param,
   ParseIntPipe,
   Patch,
   Post,
   Query,
   Req,
+  Res,
   UseGuards,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { AuthGuard, OptionalAuthGuard, type AuthenticatedRequest } from '../auth/auth.guard';
 import { DatabaseService, ReservationRow } from '../database/database.service';
 import { IcspService } from './icspace.service';
@@ -31,6 +34,22 @@ export class LibraryController {
       areas: this.icspService.getAreas(),
       countdown: this.schedulerService.getNextReleaseCountdown(),
     };
+  }
+
+  @UseGuards(OptionalAuthGuard)
+  @Get('areas/:areaId/floorplan')
+  async getAreaFloorPlan(
+    @Req() req: AuthenticatedRequest,
+    @Param('areaId') areaId: string,
+    @Res() res: Response,
+  ) {
+    const img = await this.icspService.getAreaFloorPlanImage(req.user, areaId);
+    if (!img) {
+      throw new NotFoundException('暂未获取到该区域平面底图');
+    }
+    res.setHeader('Content-Type', img.contentType);
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    return res.send(img.buffer);
   }
 
   @UseGuards(OptionalAuthGuard)

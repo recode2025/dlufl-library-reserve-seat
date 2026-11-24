@@ -4,15 +4,26 @@ import {
   CalendarClock,
   CheckCircle2,
   Clock,
+  Grid3X3,
   KeyRound,
+  Map as MapIcon,
   Radio,
   RefreshCw,
   Search,
+  Server,
   Sparkles,
   Square,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-react';
 import { api } from '../api';
-import type { LibraryArea, SeatInfo, SeatsResponse, UserProfile } from '../types';
+import type {
+  LibraryArea,
+  ScheduledTask,
+  SeatInfo,
+  SeatsResponse,
+  UserProfile,
+} from '../types';
 
 interface SeatSelectorProps {
   areas: LibraryArea[];
@@ -62,6 +73,11 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
   const [filterStatus, setFilterStatus] = useState<'all' | 'free' | 'partial' | 'available'>('all');
   const [seatKeyword, setSeatKeyword] = useState('');
 
+  // 视图模式：真实坐标平面位置图 / 网格列表
+  const [viewMode, setViewMode] = useState<'map' | 'grid'>('map');
+  const [mapZoom, setMapZoom] = useState<number>(1);
+  const [floorPlanImgOk, setFloorPlanImgOk] = useState(true);
+
   const [data, setData] = useState<SeatsResponse | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
@@ -77,18 +93,22 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
     null,
   );
 
-  // 预约页面内置「自动刷新轮询找座直到约上」状态（可控范围 5–60 秒滑块）
-  const [isPollingGrab, setIsPollingGrab] = useState(false);
+  // 真正的「服务器端后台轮询抢座」状态（约座完全由 NestJS 服务器完成，关网页照常继续！）
   const [pollIntervalSec, setPollIntervalSec] = useState(10);
   const [pollAllowPartial, setPollAllowPartial] = useState(true);
   const [pollLockSeat, setPollLockSeat] = useState(false);
-  const [pollAttempts, setPollAttempts] = useState(0);
-  const [pollStatusText, setPollStatusText] = useState('');
-  const pollingBusyRef = useRef(false);
+  const [serverTasks, setServerTasks] = useState<ScheduledTask[]>([]);
+  const [serverActionBusy, setServerActionBusy] = useState(false);
+  const prevPollingIdsRef = useRef<Set<number>>(new Set());
 
   useEffect(() => {
     if (initialAreaId) setAreaId(initialAreaId);
   }, [initialAreaId]);
+
+  useEffect(() => {
+    setFloorPlanImgOk(true);
+    setMapZoom(1);
+  }, [areaId]);
 
   const loadSeats = useCallback(async (): Promise<SeatsResponse | null> => {
     const seq = ++reqSeqRef.current;
@@ -129,122 +149,71 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
     }
   }, [areaId, date, startTime, endTime]);
 
+  const syncServerTasks = useCallback(async () => {
+    if (!user) {
+      setServerTasks([]);
+      return;
+    }
+    try {
+      const res = await api.library.schedules();
+      // 检测是否有正在轮询的服务器端任务刚刚成功约上
+      for (const t of res.tasks) {
+        if (prevPollingIdsRef.current.has(t.id) && t.status === 'succeeded') {
+          setFeedback({
+            type: 'success',
+            text: `服务器端后台轮询已成功约上：${t.lastMessage || t.lastSeatName || '已锁定座位'}`,
+          });
+          void loadSeats();
+          void onBookedSuccess();
+        }
+      }
+      prevPollingIdsRef.current = new Set(
+        res.tasks.filter((t) => t.status === 'polling').map((t) => t.id),
+      );
+      setServerTasks(res.tasks);
+    } catch {
+      // ignore transient sync errors
+    }
+  }, [user, loadSeats, onBookedSuccess]);
+
   useEffect(() => {
     void loadSeats();
   }, [loadSeats]);
 
-  // 静默 AJAX 定时刷新（未登录与已登录均支持，原地更新数据，无阴影/骨架闪烁）
   useEffect(() => {
-    if (!autoRefresh || isPollingGrab) return;
+    void syncServerTasks();
+  }, [syncServerTasks]);
+
+  // 静默 AJAX 定时刷新座位显示（仅用于界面展示，不承担抢座逻辑）
+  useEffect(() => {
+    if (!autoRefresh) return;
     const timer = window.setInterval(() => {
       void loadSeats();
     }, 15000);
     return () => window.clearInterval(timer);
-  }, [autoRefresh, isPollingGrab, loadSeats]);
+  }, [autoRefresh, loadSeats]);
 
-  // 预约页内轮询找座引擎：持续 AJAX 刷新并在发现满足条件的空闲区间（含当前空闲区间中途起约）时自动预约，直到约上
-  const executeSinglePollCycle = useCallback(async () => {
-    if (pollingBusyRef.current) return;
-    pollingBusyRef.current = true;
-    try {
-      const res = await loadSeats();
-      setPollAttempts((n) => n + 1);
-      if (!res) {
-        setPollStatusText('本次拉取座位异常，将在下个周期重试...');
-        return;
-      }
+  const activeServerTask = useMemo(() => {
+    return (
+      serverTasks.find(
+        (t) =>
+          t.status === 'polling' &&
+          t.areaIds.includes(areaId) &&
+          (!t.activeTargetDate || t.activeTargetDate === date),
+      ) ||
+      serverTasks.find((t) => t.status === 'polling') ||
+      null
+    );
+  }, [serverTasks, areaId, date]);
 
-      if (res.batchStatus && !res.batchStatus.bookable) {
-        setPollStatusText(`${res.batchStatus.message}（持续轮询等待放座中...）`);
-        return;
-      }
-
-      const pool =
-        pollLockSeat && selectedSeat
-          ? res.seats.filter((s) => s.devId === selectedSeat.devId)
-          : res.seats;
-
-      // 优先全时段空闲，其次在允许部分时段可约时选最长可用空闲区间（已按当前时刻自动校准）
-      let bestSeat: SeatInfo | null = null;
-      for (const s of pool) {
-        if (s.status === 'free' && s.longestFreeSlot && s.longestFreeSlot.durationMin >= 30) {
-          if (
-            !bestSeat ||
-            bestSeat.status !== 'free' ||
-            s.longestFreeSlot.durationMin > (bestSeat.longestFreeSlot?.durationMin ?? 0)
-          ) {
-            bestSeat = s;
-          }
-        } else if (
-          pollAllowPartial &&
-          s.status === 'partial' &&
-          s.longestFreeSlot &&
-          s.longestFreeSlot.durationMin >= 30
-        ) {
-          if (
-            !bestSeat ||
-            (bestSeat.status !== 'free' &&
-              s.longestFreeSlot.durationMin > (bestSeat.longestFreeSlot?.durationMin ?? 0))
-          ) {
-            bestSeat = s;
-          }
-        }
-      }
-
-      if (!bestSeat || !bestSeat.longestFreeSlot) {
-        setPollStatusText(
-          `当前区域暂未发现${pollAllowPartial ? '全时段或部分时段' : '全时段'}可用空位，${pollIntervalSec} 秒后继续轮询...`,
-        );
-        return;
-      }
-
-      const slot = bestSeat.longestFreeSlot;
-      setPollStatusText(
-        `发现可用座位 ${bestSeat.devName}（${slot.startStr}–${slot.endStr}），正在自动提交预约...`,
-      );
-      setSelectedSeat(bestSeat);
-
-      try {
-        const reserveRes = await api.library.reserve({
-          areaId: bestSeat.areaId,
-          devId: bestSeat.devId,
-          seatName: bestSeat.devName,
-          targetDate: date,
-          startTime: slot.startStr,
-          endTime: slot.endStr,
-        });
-        setIsPollingGrab(false);
-        const okText = `轮询成功约上座位：${reserveRes.message}`;
-        setPollStatusText(okText);
-        setFeedback({ type: 'success', text: okText });
-        await Promise.all([loadSeats(), onBookedSuccess()]);
-      } catch (err: any) {
-        setPollStatusText(
-          `尝试预约 ${bestSeat.devName} 未成功（${err?.message || '已被抢占'}），继续轮询下一空位...`,
-        );
-      }
-    } finally {
-      pollingBusyRef.current = false;
-    }
-  }, [
-    loadSeats,
-    pollLockSeat,
-    selectedSeat,
-    pollAllowPartial,
-    pollIntervalSec,
-    date,
-    onBookedSuccess,
-  ]);
-
+  // 当存在服务器端后台轮询任务时，每 5 秒同步一次服务器进度展示（关掉网页服务器照常继续约座）
   useEffect(() => {
-    if (!isPollingGrab) return;
-    const safeSec = Math.max(5, Math.min(60, pollIntervalSec));
-    void executeSinglePollCycle();
+    if (!user || !activeServerTask) return;
     const timer = window.setInterval(() => {
-      void executeSinglePollCycle();
-    }, safeSec * 1000);
+      void syncServerTasks();
+    }, 5000);
     return () => window.clearInterval(timer);
-  }, [isPollingGrab, pollIntervalSec, executeSinglePollCycle]);
+  }, [user, activeServerTask, syncServerTasks]);
 
   useEffect(() => {
     if (selectedSeat?.longestFreeSlot) {
@@ -256,33 +225,33 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
     }
   }, [selectedSeat, data?.effectiveStartTime, data?.effectiveEndTime, startTime, endTime]);
 
-  const filteredSeats = useMemo(() => {
+  const matchedSeatIds = useMemo(() => {
     const seats = data?.seats || [];
-    return seats.filter((s) => {
-      if (filterStatus === 'free' && s.status !== 'free') return false;
-      if (filterStatus === 'partial' && s.status !== 'partial') return false;
-      if (filterStatus === 'available' && s.status !== 'free' && s.status !== 'partial') {
-        return false;
-      }
+    const set = new Set<string>();
+    for (const s of seats) {
+      if (filterStatus === 'free' && s.status !== 'free') continue;
+      if (filterStatus === 'partial' && s.status !== 'partial') continue;
+      if (filterStatus === 'available' && s.status !== 'free' && s.status !== 'partial') continue;
       if (seatKeyword.trim()) {
         const kw = seatKeyword.trim().toLowerCase();
-        if (
-          !s.devName.toLowerCase().includes(kw) &&
-          !String(s.seatNumber).includes(kw)
-        ) {
-          return false;
+        if (!s.devName.toLowerCase().includes(kw) && !String(s.seatNumber).includes(kw)) {
+          continue;
         }
       }
-      return true;
-    });
+      set.add(s.devId);
+    }
+    return set;
   }, [data, filterStatus, seatKeyword]);
 
-  const handleTogglePollingGrab = () => {
-    if (isPollingGrab) {
-      setIsPollingGrab(false);
-      setPollStatusText('已手动停止本页轮询。');
-      return;
-    }
+  const filteredSeats = useMemo(() => {
+    return (data?.seats || []).filter((s) => matchedSeatIds.has(s.devId));
+  }, [data, matchedSeatIds]);
+
+  const canShowMap = Boolean(data?.hasCoordinates && (data?.seats?.length ?? 0) > 0);
+  const effectiveViewMode = viewMode === 'map' && canShowMap ? 'map' : 'grid';
+
+  // 启动/停止真正的「服务器端后台轮询找座」
+  const handleToggleServerPolling = async () => {
     if (!user) {
       onOpenLogin();
       return;
@@ -291,10 +260,78 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
       onOpenBind();
       return;
     }
-    setPollAttempts(0);
+
+    setServerActionBusy(true);
+    setError(null);
     setFeedback(null);
-    setPollStatusText('已开启自动刷新轮询找座，正在扫描可用座位...');
-    setIsPollingGrab(true);
+
+    try {
+      if (activeServerTask) {
+        await api.library.stopSchedule(activeServerTask.id);
+        setFeedback({ type: 'success', text: '已通知服务器停止本轮后台轮询找座。' });
+        await syncServerTasks();
+        return;
+      }
+
+      const areaName = areas.find((a) => a.id === areaId)?.name || areaId;
+      const taskName =
+        pollLockSeat && selectedSeat
+          ? `[实时盯座] ${areaName} ${selectedSeat.devName}`
+          : `[实时盯座] ${areaName}`;
+
+      // 优先复用已有的同名非周期盯座任务，避免重复占用单用户 5 个任务配额
+      const reusable = serverTasks.find(
+        (t) => !t.isRecurring && t.name.startsWith('[实时盯座]') && t.status !== 'polling',
+      );
+
+      const payload = {
+        name: taskName,
+        areaIds: [areaId],
+        preferredSeats: pollLockSeat && selectedSeat ? [selectedSeat.seatNumber] : [],
+        seatMin: pollLockSeat && selectedSeat ? selectedSeat.seatNumber : 1,
+        seatMax: pollLockSeat && selectedSeat ? selectedSeat.seatNumber : 500,
+        startTime,
+        endTime,
+        minFreeRate: pollAllowPartial ? 20 : 95,
+        forceFullRange: !pollAllowPartial,
+        triggerTime: '18:01',
+        targetDayOffset: date === formatDateOffset(0) ? 0 : 1,
+        weekdays: [0, 1, 2, 3, 4, 5, 6],
+        isRecurring: false,
+        pollIntervalSec: Math.max(5, Math.min(60, pollIntervalSec)),
+        maxPollMinutes: 0, // 服务器端持续轮询直到约上
+        enabled: true,
+      };
+
+      let taskId: number;
+      if (reusable) {
+        const updated = await api.library.updateSchedule(reusable.id, payload);
+        taskId = updated.task.id;
+      } else {
+        const created = await api.library.createSchedule(payload);
+        taskId = created.task.id;
+      }
+
+      const triggered = await api.library.triggerSchedule(taskId, date);
+      await syncServerTasks();
+
+      if (triggered.task.status === 'succeeded') {
+        setFeedback({
+          type: 'success',
+          text: `服务器端立即约上成功：${triggered.task.lastMessage}`,
+        });
+        await Promise.all([loadSeats(), onBookedSuccess()]);
+      } else {
+        setFeedback({
+          type: 'success',
+          text: `已交由服务器端后台持续轮询（每 ${payload.pollIntervalSec} 秒扫描一次），关闭本网页或手机锁屏均会继续抢座直到约上！`,
+        });
+      }
+    } catch (err: any) {
+      setError(err?.message || '操作服务器端轮询失败');
+    } finally {
+      setServerActionBusy(false);
+    }
   };
 
   const handleBook = async () => {
@@ -528,7 +565,7 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
           </div>
         </div>
 
-        {/* Quick Partial-Slot Hint when full slot is unavailable */}
+        {/* Quick Partial-Slot Hint */}
         {noFullSeat && (data?.summary.partial ?? 0) > 0 && filterStatus !== 'partial' && (
           <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-2 text-xs text-amber-900">
             <span>
@@ -546,10 +583,10 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
         )}
       </div>
 
-      {/* Built-in Live Seat Polling & Auto-Book Bar (当无空位或需要盯座捡漏时直接在预约页开启轮询直到约上) */}
+      {/* 100% Server-Side Polling Auto-Book Bar */}
       <div
         className={`rounded-xl border px-4 py-3.5 transition-colors ${
-          isPollingGrab
+          activeServerTask
             ? 'border-[#DF7900] bg-[#FFF7ED]'
             : noAvailableSeat
               ? 'border-[#0D386B]/35 bg-[#EFF5FC]'
@@ -558,28 +595,29 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
       >
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-start gap-2.5">
-            <Radio
-              className={`mt-0.5 h-4 w-4 shrink-0 ${
-                isPollingGrab ? 'polling-dot text-[#DF7900]' : 'text-[#0D386B]'
-              }`}
-            />
+            {activeServerTask ? (
+              <Radio className="polling-dot mt-0.5 h-4 w-4 shrink-0 text-[#DF7900]" />
+            ) : (
+              <Server className="mt-0.5 h-4 w-4 shrink-0 text-[#0D386B]" />
+            )}
             <div>
               <div className="flex flex-wrap items-center gap-2 text-sm font-semibold text-[#0D223D]">
-                <span>本区自动刷新轮询抢座（无空位自动盯座，直到约上）</span>
-                {isPollingGrab && (
+                <span>服务器端后台轮询抢座（关网页 / 手机锁屏仍继续约座）</span>
+                {activeServerTask && (
                   <span className="rounded-full bg-[#DF7900] px-2 py-0.5 font-mono text-[11px] font-semibold text-white">
-                    轮询中 · 第 {pollAttempts} 次
+                    服务端轮询中 · 第 {activeServerTask.pollAttempts} 次
                   </span>
                 )}
-                {!isPollingGrab && noAvailableSeat && (
+                {!activeServerTask && noAvailableSeat && (
                   <span className="rounded-full bg-[#0D386B] px-2 py-0.5 text-[11px] font-medium text-white">
-                    当前无空位 · 建议开启
+                    当前无空位 · 建议交由服务端盯座
                   </span>
                 )}
               </div>
               <p className="mt-0.5 text-xs text-[#4D627A]">
-                {pollStatusText ||
-                  '开启后按间隔静默 AJAX 刷新当前区域，自动校准当前可约起始时间（空闲区间中途也可立即起约），一旦出现可用座位立即自动提交预约并停止。'}
+                {activeServerTask
+                  ? `${activeServerTask.name}（目标 ${activeServerTask.activeTargetDate || date}）：${activeServerTask.lastMessage || '服务器正在持续扫描空位...'}`
+                  : '由后端 NestJS 调度引擎持续执行查座、时间校准与自动提交预约（不依赖浏览器在线），直到成功约上座位。'}
               </p>
             </div>
           </div>
@@ -594,9 +632,9 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
                 step={5}
                 value={pollIntervalSec}
                 onChange={(e) => setPollIntervalSec(Number(e.target.value))}
-                disabled={isPollingGrab}
+                disabled={Boolean(activeServerTask) || serverActionBusy}
                 className="w-24 accent-[#0D386B] disabled:opacity-60"
-                aria-label="轮询间隔（5到60秒）"
+                aria-label="服务器端轮询间隔（5到60秒）"
               />
               <span className="w-8 text-right font-mono font-semibold text-[#0D386B]">
                 {pollIntervalSec}s
@@ -608,7 +646,7 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
                 type="checkbox"
                 checked={pollAllowPartial}
                 onChange={(e) => setPollAllowPartial(e.target.checked)}
-                disabled={isPollingGrab}
+                disabled={Boolean(activeServerTask) || serverActionBusy}
                 className="accent-[#0D386B]"
               />
               含部分时段可约
@@ -620,7 +658,7 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
                   type="checkbox"
                   checked={pollLockSeat}
                   onChange={(e) => setPollLockSeat(e.target.checked)}
-                  disabled={isPollingGrab}
+                  disabled={Boolean(activeServerTask) || serverActionBusy}
                   className="accent-[#0D386B]"
                 />
                 仅盯 {selectedSeat.devName}
@@ -629,22 +667,23 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
 
             <button
               type="button"
-              onClick={handleTogglePollingGrab}
-              className={`inline-flex items-center gap-1.5 rounded-lg px-3.5 py-2 text-xs font-semibold text-white ${
-                isPollingGrab
+              onClick={handleToggleServerPolling}
+              disabled={serverActionBusy}
+              className={`inline-flex items-center gap-1.5 rounded-lg px-3.5 py-2 text-xs font-semibold text-white disabled:opacity-60 ${
+                activeServerTask
                   ? 'bg-[#B45309] hover:bg-[#92400E]'
                   : 'bg-[#0D386B] hover:bg-[#0A2C55]'
               }`}
             >
-              {isPollingGrab ? (
+              {activeServerTask ? (
                 <>
                   <Square className="h-3.5 w-3.5" />
-                  停止轮询
+                  停止服务端轮询
                 </>
               ) : (
                 <>
-                  <Radio className="h-3.5 w-3.5" />
-                  开启轮询找座
+                  <Server className="h-3.5 w-3.5" />
+                  开启服务端轮询找座
                 </>
               )}
             </button>
@@ -685,27 +724,166 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
         </div>
       )}
 
-      {/* Main Split: Seat Map Grid + Right Inspector */}
+      {/* Main Split: Spatial Floor-Plan / Grid + Right Inspector */}
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
         <div className="rounded-xl border border-[#DCE4EE] bg-white p-5 lg:col-span-8">
-          <div className="mb-3 flex items-center justify-between">
-            <h3 className="text-sm font-semibold text-[#0D223D]">
-              {data?.area.name || '阅览区'} 座位分布图
-            </h3>
-            <span className="font-mono text-xs text-[#64748B]">
-              {refreshing
-                ? '正在同步最新座位...'
-                : lastUpdated
-                  ? `上次同步 ${lastUpdated}`
-                  : '点击座位查看空闲时段'}
-            </span>
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-3">
+              <h3 className="text-sm font-semibold text-[#0D223D]">
+                {data?.area.name || '阅览区'} 座位分布图
+              </h3>
+              <div className="inline-flex rounded-lg border border-[#DCE4EE] bg-[#F8FAFC] p-0.5 text-xs">
+                <button
+                  type="button"
+                  disabled={!canShowMap}
+                  onClick={() => setViewMode('map')}
+                  className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 font-medium transition-colors disabled:opacity-40 ${
+                    effectiveViewMode === 'map'
+                      ? 'bg-[#0D386B] text-white'
+                      : 'text-[#4D627A] hover:text-[#0D223D]'
+                  }`}
+                >
+                  <MapIcon className="h-3.5 w-3.5" />
+                  对应位置图
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setViewMode('grid')}
+                  className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 font-medium transition-colors ${
+                    effectiveViewMode === 'grid'
+                      ? 'bg-[#0D386B] text-white'
+                      : 'text-[#4D627A] hover:text-[#0D223D]'
+                  }`}
+                >
+                  <Grid3X3 className="h-3.5 w-3.5" />
+                  列表网格
+                </button>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              {effectiveViewMode === 'map' && (
+                <div className="inline-flex items-center gap-1 rounded-lg border border-[#DCE4EE] bg-[#F8FAFC] px-1.5 py-0.5 text-xs text-[#4D627A]">
+                  <button
+                    type="button"
+                    onClick={() => setMapZoom((z) => Math.max(1, Number((z - 0.35).toFixed(2))))}
+                    disabled={mapZoom <= 1}
+                    className="rounded p-1 hover:bg-white disabled:opacity-40"
+                    title="缩小平面图"
+                  >
+                    <ZoomOut className="h-3.5 w-3.5" />
+                  </button>
+                  <span className="w-10 text-center font-mono text-[11px]">
+                    {Math.round(mapZoom * 100)}%
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setMapZoom((z) => Math.min(2.4, Number((z + 0.35).toFixed(2))))}
+                    disabled={mapZoom >= 2.4}
+                    className="rounded p-1 hover:bg-white disabled:opacity-40"
+                    title="放大平面图"
+                  >
+                    <ZoomIn className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              )}
+
+              <span className="font-mono text-xs text-[#64748B]">
+                {refreshing
+                  ? '正在同步最新座位...'
+                  : lastUpdated
+                    ? `上次同步 ${lastUpdated}`
+                    : '点击座位查看空闲时段'}
+              </span>
+            </div>
           </div>
 
-          {filteredSeats.length === 0 ? (
+          {(data?.seats?.length ?? 0) === 0 ? (
             <div className="rounded-xl border border-dashed border-[#CBD5E1] bg-[#F8FAFC] py-14 text-center text-sm text-[#4D627A]">
               {refreshing && !data
                 ? '正在获取该区域座位列表...'
-                : '当前筛选条件下没有可显示的座位，可切换筛选或开启上方「轮询找座」。'}
+                : '当前暂未加载到座位数据，请确认已完成授权或稍后刷新。'}
+            </div>
+          ) : effectiveViewMode === 'map' ? (
+            /* 真实对应位置平面座位图 */
+            <div className="overflow-auto rounded-xl border border-[#DCE4EE] bg-[#F8FAFC]">
+              <div
+                style={{
+                  width: `${Math.round(mapZoom * 100)}%`,
+                  minWidth: '640px',
+                }}
+                className="relative mx-auto select-none"
+              >
+                {data?.floorPlanUrl && floorPlanImgOk ? (
+                  <img
+                    src={data.floorPlanUrl}
+                    alt={`${data.area.name} 平面座位图`}
+                    draggable={false}
+                    onError={() => setFloorPlanImgOk(false)}
+                    className="block h-auto w-full"
+                  />
+                ) : (
+                  <div
+                    className="aspect-[16/10] w-full"
+                    style={{
+                      backgroundImage:
+                        'radial-gradient(circle, #cbd5e1 1px, transparent 1px)',
+                      backgroundSize: '20px 20px',
+                    }}
+                  />
+                )}
+
+                {(data?.seats || []).map((seat) => {
+                  if (seat.coordX === null || seat.coordY === null) return null;
+                  const isSelected = selectedSeat?.devId === seat.devId;
+                  const isMatched = matchedSeatIds.has(seat.devId);
+
+                  const dotClass =
+                    seat.status === 'free'
+                      ? 'border-emerald-600 bg-emerald-500 text-white hover:bg-emerald-600'
+                      : seat.status === 'partial'
+                        ? 'border-amber-600 bg-amber-400 text-[#0D223D] hover:bg-amber-500'
+                        : seat.status === 'unreleased'
+                          ? 'border-dashed border-slate-400 bg-slate-200/90 text-slate-600'
+                          : 'border-slate-400 bg-slate-300/90 text-slate-600';
+
+                  return (
+                    <button
+                      key={seat.devId}
+                      type="button"
+                      onClick={() => {
+                        setSelectedSeat(seat);
+                        setFeedback(null);
+                      }}
+                      title={`${seat.devName} · ${
+                        seat.status === 'free'
+                          ? '全时段可约'
+                          : seat.status === 'partial'
+                            ? `部分时段可约 (${seat.longestFreeSlot?.startStr}-${seat.longestFreeSlot?.endStr})`
+                            : seat.status === 'unreleased'
+                              ? '未放座'
+                              : '已满'
+                      }`}
+                      style={{
+                        left: `${seat.coordX}%`,
+                        top: `${seat.coordY}%`,
+                        transform: 'translate(-50%, -50%)',
+                      }}
+                      className={`absolute flex h-5 min-w-5 items-center justify-center rounded-full border px-1 font-mono text-[9px] font-bold leading-none shadow-sm transition-transform hover:z-20 hover:scale-125 ${dotClass} ${
+                        isSelected
+                          ? 'z-30 scale-125 ring-2 ring-[#0D386B] ring-offset-1'
+                          : 'z-10'
+                      } ${isMatched ? 'opacity-100' : 'opacity-20'}`}
+                    >
+                      {seat.seatNumber}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ) : filteredSeats.length === 0 ? (
+            <div className="rounded-xl border border-dashed border-[#CBD5E1] bg-[#F8FAFC] py-14 text-center text-sm text-[#4D627A]">
+              当前筛选条件下没有可显示的座位，可切换筛选或开启上方「服务端轮询找座」。
             </div>
           ) : (
             <div className="grid grid-cols-4 gap-2 sm:grid-cols-6 md:grid-cols-8">
@@ -831,11 +1009,11 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
                 {selectedSeat.status === 'unreleased' ? (
                   <p className="mt-1.5 text-xs text-[#0D386B]">
                     {data?.batchStatus?.message ||
-                      '该日期尚未到达 18:00 放座时间，暂不可直接预约；可点击下方按钮提前设为 18:01 自动抢座心仪座位。'}
+                      '该日期尚未开放预约，可点击下方按钮提前设为 18:01 自动抢座心仪座位。'}
                   </p>
                 ) : selectedSeat.freeSlots.length === 0 ? (
                   <p className="mt-1.5 text-xs text-red-600">
-                    当前校准时段内没有剩余空档，可开启上方「轮询找座」或将该座加入「18:01 定时抢座」。
+                    当前校准时段内没有剩余空档，可开启上方「服务器端轮询找座」持续盯座。
                   </p>
                 ) : (
                   <div className="mt-2 flex flex-wrap gap-2">

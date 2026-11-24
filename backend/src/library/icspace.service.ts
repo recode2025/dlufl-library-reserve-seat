@@ -22,6 +22,8 @@ export interface SeatInfo {
   seatNumber: number;
   areaId: string;
   areaName: string;
+  coordX: number | null;
+  coordY: number | null;
   status: 'free' | 'partial' | 'occupied' | 'unreleased';
   freeRate: number;
   longestFreeSlot: TimeSlot | null;
@@ -59,6 +61,12 @@ export class IcspService {
   // 上游房间座位快照 3 秒合并缓存：多用户同时刷新/轮询同一区域时，每 3 秒最多向上游 ICSpace 发起 1 次请求，防限流封禁
   private readonly areaRawCache = new Map<string, { data: any[]; fetchedAt: number }>();
   private readonly AREA_CACHE_TTL_MS = 3000;
+  // 区域平面底图缓存（12 小时有效）
+  private readonly floorPlanCache = new Map<
+    string,
+    { buffer: Buffer; contentType: string; fetchedAt: number }
+  >();
+  private readonly FLOOR_PLAN_TTL_MS = 12 * 60 * 60 * 1000;
 
   constructor(private readonly dbService: DatabaseService) {}
 
@@ -391,6 +399,71 @@ export class IcspService {
     return { busySlots, freeSlots, longestFreeSlot, freeRate };
   }
 
+  private parseSeatCoordinate(raw: unknown): { coordX: number | null; coordY: number | null } {
+    if (!raw || typeof raw !== 'string') return { coordX: null, coordY: null };
+    const parts = raw.split(',');
+    if (parts.length < 2) return { coordX: null, coordY: null };
+    const x = parseFloat(parts[0]);
+    const y = parseFloat(parts[1]);
+    if (Number.isNaN(x) || Number.isNaN(y) || x < 0 || x > 100 || y < 0 || y > 100) {
+      return { coordX: null, coordY: null };
+    }
+    return { coordX: x, coordY: y };
+  }
+
+  /**
+   * 代理拉取 ICSpace 官方区域平面底图（GET /ic-web/sysInfo?sysType=2&sysValue=roomId&sysKind=16 -> content）
+   */
+  async getAreaFloorPlanImage(
+    user: UserRow | undefined,
+    areaId: string,
+  ): Promise<{ buffer: Buffer; contentType: string } | null> {
+    const cached = this.floorPlanCache.get(areaId);
+    if (cached && Date.now() - cached.fetchedAt < this.FLOOR_PLAN_TTL_MS) {
+      return { buffer: cached.buffer, contentType: cached.contentType };
+    }
+
+    if (appConfig.mockMode) return null;
+
+    let sessionUser: UserRow | undefined = user && user.icspace_bound ? user : undefined;
+    if (!sessionUser) {
+      sessionUser = this.dbService.db
+        .prepare(
+          `SELECT * FROM users WHERE icspace_bound = 1 AND encrypted_cas_password IS NOT NULL ORDER BY updated_at DESC LIMIT 1`,
+        )
+        .get() as UserRow | undefined;
+    }
+    if (!sessionUser) return null;
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const session = await this.ensureUserSession(sessionUser, attempt > 0);
+        const client = this.createClientFromCookies(session.cookies);
+        const infoUrl = `${appConfig.icspace.host}/ic-web/sysInfo?sysType=2&sysValue=${encodeURIComponent(areaId)}&sysKind=16`;
+        const infoResp = await client.get(infoUrl);
+        if (infoResp.data?.code !== 0) {
+          if (attempt === 0) continue;
+          return null;
+        }
+        const content = String(infoResp.data?.data?.content || '').trim();
+        if (!content) return null;
+
+        const imgUrl = content.startsWith('http')
+          ? content
+          : `${appConfig.icspace.host}/${content.replace(/^\/+/, '')}`;
+        const imgResp = await client.get(imgUrl, { responseType: 'arraybuffer', timeout: 15000 });
+        const buffer = Buffer.from(imgResp.data);
+        const contentType = String(imgResp.headers['content-type'] || 'image/png');
+        this.floorPlanCache.set(areaId, { buffer, contentType, fetchedAt: Date.now() });
+        return { buffer, contentType };
+      } catch (e: any) {
+        if (attempt === 0) continue;
+        this.logger.warn(`Failed to fetch floor plan for area ${areaId}: ${e?.message}`);
+      }
+    }
+    return null;
+  }
+
   private extractSeatNumber(devName: string, fallbackIndex: number): number {
     const parts = devName.split('-');
     const tail = parts[parts.length - 1] || devName;
@@ -470,12 +543,21 @@ export class IcspService {
       if (freeRate >= 98) status = 'free';
       else if (longestFreeSlot && longestFreeSlot.durationMin >= 30) status = 'partial';
 
+      const cols = 12;
+      const col = (i - 1) % cols;
+      const row = Math.floor((i - 1) / cols);
+      const totalRows = Math.ceil(area.defaultSeatCount / cols);
+      const coordX = Number((6 + (col / (cols - 1)) * 88).toFixed(2));
+      const coordY = Number((10 + (row / Math.max(1, totalRows - 1)) * 80).toFixed(2));
+
       seats.push({
         devId,
         devName,
         seatNumber: i,
         areaId: area.id,
         areaName: area.name,
+        coordX,
+        coordY,
         status,
         freeRate,
         longestFreeSlot,
@@ -864,6 +946,8 @@ export class IcspService {
     effectiveStartTime: string;
     effectiveEndTime: string;
     timeCalibrated: boolean;
+    hasCoordinates: boolean;
+    floorPlanUrl: string | null;
     isLive: boolean;
     batchStatus: BatchReleaseStatus;
     notice?: string;
@@ -903,6 +987,8 @@ export class IcspService {
         effectiveStartTime: calibratedRange.effectiveStartTime,
         effectiveEndTime: calibratedRange.effectiveEndTime,
         timeCalibrated: calibratedRange.calibrated,
+        hasCoordinates: true,
+        floorPlanUrl: null,
         isLive: false,
         batchStatus,
         notice: batchStatus.bookable
@@ -983,6 +1069,8 @@ export class IcspService {
           effectiveStartTime: calibratedRange.effectiveStartTime,
           effectiveEndTime: calibratedRange.effectiveEndTime,
           timeCalibrated: calibratedRange.calibrated,
+          hasCoordinates: false,
+          floorPlanUrl: null,
           isLive: false,
           batchStatus,
           notice: !user
@@ -1042,12 +1130,16 @@ export class IcspService {
         packetReleaseAt = evaluated.releaseAt;
       }
 
+      const { coordX, coordY } = this.parseSeatCoordinate(device?.coordinate);
+
       return {
         devId: String(device.devId),
         devName,
         seatNumber,
         areaId: area.id,
         areaName: area.name,
+        coordX,
+        coordY,
         status: evaluated.status,
         freeRate: evaluated.freeRate,
         longestFreeSlot: evaluated.longestFreeSlot,
@@ -1057,6 +1149,7 @@ export class IcspService {
     });
 
     seats.sort((a, b) => a.seatNumber - b.seatNumber);
+    const hasCoordinates = seats.some((s) => s.coordX !== null && s.coordY !== null);
 
     const allUnreleased = seats.length > 0 && seats.every((s) => s.status === 'unreleased');
     const effectiveBatchStatus: BatchReleaseStatus = allUnreleased
@@ -1093,6 +1186,8 @@ export class IcspService {
       effectiveStartTime: calibratedRange.effectiveStartTime,
       effectiveEndTime: calibratedRange.effectiveEndTime,
       timeCalibrated: calibratedRange.calibrated,
+      hasCoordinates,
+      floorPlanUrl: hasCoordinates ? `/api/library/areas/${area.id}/floorplan` : null,
       isLive: true,
       batchStatus: effectiveBatchStatus,
       notice: finalNotice,

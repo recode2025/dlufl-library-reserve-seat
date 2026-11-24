@@ -60,6 +60,8 @@ export interface SeatInfo {
   seatNumber: number;
   areaId: string;
   areaName: string;
+  coordX: number | null;
+  coordY: number | null;
   status: 'free' | 'partial' | 'occupied' | 'unreleased';
   freeRate: number;
   longestFreeSlot: TimeSlot | null;
@@ -82,6 +84,8 @@ export interface SeatsResponse {
   effectiveStartTime?: string;
   effectiveEndTime?: string;
   timeCalibrated?: boolean;
+  hasCoordinates?: boolean;
+  floorPlanUrl?: string | null;
   isLive: boolean;
   batchStatus?: BatchReleaseStatus;
   notice?: string;
