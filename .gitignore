@@ -173,3 +173,10 @@ dist
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# Library SQLite runtime data & PM2 logs
+backend/data/
+logs/
+*.db
+*.db-wal
+*.db-shm
