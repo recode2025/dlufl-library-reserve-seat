@@ -79,6 +79,9 @@ export interface SeatsResponse {
   targetDate: string;
   startTime: string;
   endTime: string;
+  effectiveStartTime?: string;
+  effectiveEndTime?: string;
+  timeCalibrated?: boolean;
   isLive: boolean;
   batchStatus?: BatchReleaseStatus;
   notice?: string;

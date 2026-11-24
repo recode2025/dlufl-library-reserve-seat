@@ -3,10 +3,13 @@ import {
   AlertCircle,
   CalendarClock,
   CheckCircle2,
+  Clock,
   KeyRound,
+  Radio,
   RefreshCw,
   Search,
   Sparkles,
+  Square,
 } from 'lucide-react';
 import { api } from '../api';
 import type { LibraryArea, SeatInfo, SeatsResponse, UserProfile } from '../types';
@@ -18,7 +21,12 @@ interface SeatSelectorProps {
   onOpenLogin: () => void;
   onOpenBind: () => void;
   onBookedSuccess: () => Promise<void>;
-  onJumpToScheduler: (preset: { areaId: string; seatNumber: number; startTime: string; endTime: string }) => void;
+  onJumpToScheduler: (preset: {
+    areaId: string;
+    seatNumber: number;
+    startTime: string;
+    endTime: string;
+  }) => void;
 }
 
 function formatDateOffset(offsetDays: number): string {
@@ -51,7 +59,7 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
   const [date, setDate] = useState(() => formatDateOffset(new Date().getHours() >= 18 ? 1 : 0));
   const [startTime, setStartTime] = useState('08:30');
   const [endTime, setEndTime] = useState('22:00');
-  const [filterStatus, setFilterStatus] = useState<'all' | 'free' | 'available'>('all');
+  const [filterStatus, setFilterStatus] = useState<'all' | 'free' | 'partial' | 'available'>('all');
   const [seatKeyword, setSeatKeyword] = useState('');
 
   const [data, setData] = useState<SeatsResponse | null>(null);
@@ -65,19 +73,30 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
   const [bookStart, setBookStart] = useState('08:30');
   const [bookEnd, setBookEnd] = useState('22:00');
   const [booking, setBooking] = useState(false);
-  const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(
+    null,
+  );
+
+  // 预约页面内置「自动刷新轮询找座直到约上」状态
+  const [isPollingGrab, setIsPollingGrab] = useState(false);
+  const [pollIntervalSec, setPollIntervalSec] = useState(5);
+  const [pollAllowPartial, setPollAllowPartial] = useState(true);
+  const [pollLockSeat, setPollLockSeat] = useState(false);
+  const [pollAttempts, setPollAttempts] = useState(0);
+  const [pollStatusText, setPollStatusText] = useState('');
+  const pollingBusyRef = useRef(false);
 
   useEffect(() => {
     if (initialAreaId) setAreaId(initialAreaId);
   }, [initialAreaId]);
 
-  const loadSeats = useCallback(async () => {
+  const loadSeats = useCallback(async (): Promise<SeatsResponse | null> => {
     const seq = ++reqSeqRef.current;
     setRefreshing(true);
     setError(null);
     try {
       const res = await api.library.seats({ areaId, date, startTime, endTime });
-      if (seq !== reqSeqRef.current) return;
+      if (seq !== reqSeqRef.current) return null;
       setData(res);
       setLastUpdated(
         new Date().toLocaleTimeString('zh-CN', {
@@ -88,12 +107,21 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
         }),
       );
       setSelectedSeat((prev) => {
-        if (!prev) return res.seats.find((s) => s.status !== 'occupied') || res.seats[0] || null;
+        if (!prev) {
+          return (
+            res.seats.find((s) => s.status === 'free') ||
+            res.seats.find((s) => s.status === 'partial') ||
+            res.seats[0] ||
+            null
+          );
+        }
         return res.seats.find((s) => s.devId === prev.devId) || res.seats[0] || null;
       });
+      return res;
     } catch (err: any) {
-      if (seq !== reqSeqRef.current) return;
+      if (seq !== reqSeqRef.current) return null;
       setError(err?.message || '加载座位状态失败');
+      return null;
     } finally {
       if (seq === reqSeqRef.current) {
         setRefreshing(false);
@@ -107,28 +135,132 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
 
   // 静默 AJAX 定时刷新（未登录与已登录均支持，原地更新数据，无阴影/骨架闪烁）
   useEffect(() => {
-    if (!autoRefresh) return;
+    if (!autoRefresh || isPollingGrab) return;
     const timer = window.setInterval(() => {
       void loadSeats();
     }, 15000);
     return () => window.clearInterval(timer);
-  }, [autoRefresh, loadSeats]);
+  }, [autoRefresh, isPollingGrab, loadSeats]);
+
+  // 预约页内轮询找座引擎：持续 AJAX 刷新并在发现满足条件的空闲区间（含当前空闲区间中途起约）时自动预约，直到约上
+  const executeSinglePollCycle = useCallback(async () => {
+    if (pollingBusyRef.current) return;
+    pollingBusyRef.current = true;
+    try {
+      const res = await loadSeats();
+      setPollAttempts((n) => n + 1);
+      if (!res) {
+        setPollStatusText('本次拉取座位异常，将在下个周期重试...');
+        return;
+      }
+
+      if (res.batchStatus && !res.batchStatus.bookable) {
+        setPollStatusText(`${res.batchStatus.message}（持续轮询等待放座中...）`);
+        return;
+      }
+
+      const pool =
+        pollLockSeat && selectedSeat
+          ? res.seats.filter((s) => s.devId === selectedSeat.devId)
+          : res.seats;
+
+      // 优先全时段空闲，其次在允许部分时段可约时选最长可用空闲区间（已按当前时刻自动校准）
+      let bestSeat: SeatInfo | null = null;
+      for (const s of pool) {
+        if (s.status === 'free' && s.longestFreeSlot && s.longestFreeSlot.durationMin >= 30) {
+          if (
+            !bestSeat ||
+            bestSeat.status !== 'free' ||
+            s.longestFreeSlot.durationMin > (bestSeat.longestFreeSlot?.durationMin ?? 0)
+          ) {
+            bestSeat = s;
+          }
+        } else if (
+          pollAllowPartial &&
+          s.status === 'partial' &&
+          s.longestFreeSlot &&
+          s.longestFreeSlot.durationMin >= 30
+        ) {
+          if (
+            !bestSeat ||
+            (bestSeat.status !== 'free' &&
+              s.longestFreeSlot.durationMin > (bestSeat.longestFreeSlot?.durationMin ?? 0))
+          ) {
+            bestSeat = s;
+          }
+        }
+      }
+
+      if (!bestSeat || !bestSeat.longestFreeSlot) {
+        setPollStatusText(
+          `当前区域暂未发现${pollAllowPartial ? '全时段或部分时段' : '全时段'}可用空位，${pollIntervalSec} 秒后继续轮询...`,
+        );
+        return;
+      }
+
+      const slot = bestSeat.longestFreeSlot;
+      setPollStatusText(
+        `发现可用座位 ${bestSeat.devName}（${slot.startStr}–${slot.endStr}），正在自动提交预约...`,
+      );
+      setSelectedSeat(bestSeat);
+
+      try {
+        const reserveRes = await api.library.reserve({
+          areaId: bestSeat.areaId,
+          devId: bestSeat.devId,
+          seatName: bestSeat.devName,
+          targetDate: date,
+          startTime: slot.startStr,
+          endTime: slot.endStr,
+        });
+        setIsPollingGrab(false);
+        const okText = `轮询成功约上座位：${reserveRes.message}`;
+        setPollStatusText(okText);
+        setFeedback({ type: 'success', text: okText });
+        await Promise.all([loadSeats(), onBookedSuccess()]);
+      } catch (err: any) {
+        setPollStatusText(
+          `尝试预约 ${bestSeat.devName} 未成功（${err?.message || '已被抢占'}），继续轮询下一空位...`,
+        );
+      }
+    } finally {
+      pollingBusyRef.current = false;
+    }
+  }, [
+    loadSeats,
+    pollLockSeat,
+    selectedSeat,
+    pollAllowPartial,
+    pollIntervalSec,
+    date,
+    onBookedSuccess,
+  ]);
+
+  useEffect(() => {
+    if (!isPollingGrab) return;
+    void executeSinglePollCycle();
+    const timer = window.setInterval(() => {
+      void executeSinglePollCycle();
+    }, Math.max(2, pollIntervalSec) * 1000);
+    return () => window.clearInterval(timer);
+  }, [isPollingGrab, pollIntervalSec, executeSinglePollCycle]);
 
   useEffect(() => {
     if (selectedSeat?.longestFreeSlot) {
       setBookStart(selectedSeat.longestFreeSlot.startStr);
       setBookEnd(selectedSeat.longestFreeSlot.endStr);
     } else {
-      setBookStart(startTime);
-      setBookEnd(endTime);
+      setBookStart(data?.effectiveStartTime || startTime);
+      setBookEnd(data?.effectiveEndTime || endTime);
     }
-  }, [selectedSeat, startTime, endTime]);
+  }, [selectedSeat, data?.effectiveStartTime, data?.effectiveEndTime, startTime, endTime]);
 
   const filteredSeats = useMemo(() => {
     const seats = data?.seats || [];
     return seats.filter((s) => {
       if (filterStatus === 'free' && s.status !== 'free') return false;
-      if (filterStatus === 'available' && (s.status === 'occupied' || s.status === 'unreleased')) {
+      if (filterStatus === 'partial' && s.status !== 'partial') return false;
+      if (filterStatus === 'available' && s.status !== 'free' && s.status !== 'partial') {
         return false;
       }
       if (seatKeyword.trim()) {
@@ -143,6 +275,26 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
       return true;
     });
   }, [data, filterStatus, seatKeyword]);
+
+  const handleTogglePollingGrab = () => {
+    if (isPollingGrab) {
+      setIsPollingGrab(false);
+      setPollStatusText('已手动停止本页轮询。');
+      return;
+    }
+    if (!user) {
+      onOpenLogin();
+      return;
+    }
+    if (!user.icspaceBound) {
+      onOpenBind();
+      return;
+    }
+    setPollAttempts(0);
+    setFeedback(null);
+    setPollStatusText('已开启自动刷新轮询找座，正在扫描可用座位...');
+    setIsPollingGrab(true);
+  };
 
   const handleBook = async () => {
     if (!selectedSeat) return;
@@ -176,6 +328,16 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
 
   const todayStr = formatDateOffset(0);
   const tomorrowStr = formatDateOffset(1);
+  const noFullSeat = Boolean(
+    data && data.summary.total > 0 && data.summary.free === 0 && data.summary.unreleased === 0,
+  );
+  const noAvailableSeat = Boolean(
+    data &&
+      data.summary.total > 0 &&
+      data.summary.free === 0 &&
+      data.summary.partial === 0 &&
+      data.summary.unreleased === 0,
+  );
 
   return (
     <div className="space-y-5">
@@ -285,7 +447,7 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
             ))}
           </div>
 
-          <div className="ml-auto flex items-center gap-2">
+          <div className="ml-auto flex flex-wrap items-center gap-2">
             <div className="relative">
               <Search className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-[#64748B]" />
               <input
@@ -303,8 +465,9 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
               className="rounded-lg border border-[#CBD5E1] bg-white px-2.5 py-1.5 text-xs text-[#0D223D]"
             >
               <option value="all">全部座位</option>
-              <option value="available">可预约（含部分空闲）</option>
-              <option value="free">仅全时段空闲</option>
+              <option value="available">所有可约（全时段+部分时段）</option>
+              <option value="free">仅全时段可约</option>
+              <option value="partial">部分时段可约</option>
             </select>
 
             <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-[#DCE4EE] bg-[#F8FAFC] px-2.5 py-1.5 text-xs text-[#4D627A]">
@@ -329,16 +492,16 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
           </div>
         </div>
 
-        {/* Legend & Summary */}
+        {/* Calibrated Time Notice + Legend */}
         <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-[#EEF2F6] pt-3 text-xs">
           <div className="flex flex-wrap items-center gap-4 text-[#4D627A]">
             <span className="inline-flex items-center gap-1.5">
               <span className="h-3 w-3 rounded-sm border border-emerald-300 bg-emerald-100" />
-              全时段空闲（{data?.summary.free ?? 0}）
+              全时段可约（{data?.summary.free ?? 0}）
             </span>
             <span className="inline-flex items-center gap-1.5">
               <span className="h-3 w-3 rounded-sm border border-amber-300 bg-amber-100" />
-              部分时段空闲（{data?.summary.partial ?? 0}）
+              部分时段可约（{data?.summary.partial ?? 0}）
             </span>
             <span className="inline-flex items-center gap-1.5">
               <span className="h-3 w-3 rounded-sm border border-slate-200 bg-slate-100" />
@@ -351,9 +514,133 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
               </span>
             )}
           </div>
-          <span className="font-mono text-[#64748B]">
-            共 {data?.summary.total ?? 0} 席 · {data?.isLive ? '实时 ICSpace 数据' : '本地/未授权视图'}
-          </span>
+          <div className="flex flex-wrap items-center gap-3 font-mono text-[#64748B]">
+            {data?.timeCalibrated && data.effectiveStartTime && (
+              <span className="inline-flex items-center gap-1 rounded bg-[#E7EEF7] px-2 py-0.5 text-[#0D386B]">
+                <Clock className="h-3 w-3" />
+                已校准可约时段 {data.effectiveStartTime}–{data.effectiveEndTime}
+              </span>
+            )}
+            <span>
+              共 {data?.summary.total ?? 0} 席 · {data?.isLive ? '实时 ICSpace 数据' : '本地/未授权视图'}
+            </span>
+          </div>
+        </div>
+
+        {/* Quick Partial-Slot Hint when full slot is unavailable */}
+        {noFullSeat && (data?.summary.partial ?? 0) > 0 && filterStatus !== 'partial' && (
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-2 text-xs text-amber-900">
+            <span>
+              当前所选整段时段暂无全空座位，但本区有{' '}
+              <strong className="font-mono">{data?.summary.partial}</strong> 个座位处于「部分时段可约」（已校准可从当前空闲区间内起约）。
+            </span>
+            <button
+              type="button"
+              onClick={() => setFilterStatus('partial')}
+              className="rounded-md bg-[#DF7900] px-2.5 py-1 font-semibold text-white hover:bg-[#C66B00]"
+            >
+              筛选部分时段可约
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Built-in Live Seat Polling & Auto-Book Bar (当无空位或需要盯座捡漏时直接在预约页开启轮询直到约上) */}
+      <div
+        className={`rounded-xl border px-4 py-3.5 transition-colors ${
+          isPollingGrab
+            ? 'border-[#DF7900] bg-[#FFF7ED]'
+            : noAvailableSeat
+              ? 'border-[#0D386B]/35 bg-[#EFF5FC]'
+              : 'border-[#DCE4EE] bg-white'
+        }`}
+      >
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-start gap-2.5">
+            <Radio
+              className={`mt-0.5 h-4 w-4 shrink-0 ${
+                isPollingGrab ? 'polling-dot text-[#DF7900]' : 'text-[#0D386B]'
+              }`}
+            />
+            <div>
+              <div className="flex flex-wrap items-center gap-2 text-sm font-semibold text-[#0D223D]">
+                <span>本区自动刷新轮询抢座（无空位自动盯座，直到约上）</span>
+                {isPollingGrab && (
+                  <span className="rounded-full bg-[#DF7900] px-2 py-0.5 font-mono text-[11px] font-semibold text-white">
+                    轮询中 · 第 {pollAttempts} 次
+                  </span>
+                )}
+                {!isPollingGrab && noAvailableSeat && (
+                  <span className="rounded-full bg-[#0D386B] px-2 py-0.5 text-[11px] font-medium text-white">
+                    当前无空位 · 建议开启
+                  </span>
+                )}
+              </div>
+              <p className="mt-0.5 text-xs text-[#4D627A]">
+                {pollStatusText ||
+                  '开启后按间隔静默 AJAX 刷新当前区域，自动校准当前可约起始时间（空闲区间中途也可立即起约），一旦出现可用座位立即自动提交预约并停止。'}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5 text-xs">
+            <select
+              value={pollIntervalSec}
+              onChange={(e) => setPollIntervalSec(Number(e.target.value))}
+              disabled={isPollingGrab}
+              className="rounded-lg border border-[#CBD5E1] bg-white px-2 py-1.5 font-mono text-xs text-[#0D223D] disabled:opacity-60"
+            >
+              <option value={3}>每 3 秒</option>
+              <option value={5}>每 5 秒</option>
+              <option value={10}>每 10 秒</option>
+            </select>
+
+            <label className="inline-flex cursor-pointer items-center gap-1.5 text-[#0D223D]">
+              <input
+                type="checkbox"
+                checked={pollAllowPartial}
+                onChange={(e) => setPollAllowPartial(e.target.checked)}
+                disabled={isPollingGrab}
+                className="accent-[#0D386B]"
+              />
+              含部分时段可约
+            </label>
+
+            {selectedSeat && (
+              <label className="inline-flex cursor-pointer items-center gap-1.5 text-[#0D223D]">
+                <input
+                  type="checkbox"
+                  checked={pollLockSeat}
+                  onChange={(e) => setPollLockSeat(e.target.checked)}
+                  disabled={isPollingGrab}
+                  className="accent-[#0D386B]"
+                />
+                仅盯 {selectedSeat.devName}
+              </label>
+            )}
+
+            <button
+              type="button"
+              onClick={handleTogglePollingGrab}
+              className={`inline-flex items-center gap-1.5 rounded-lg px-3.5 py-2 text-xs font-semibold text-white ${
+                isPollingGrab
+                  ? 'bg-[#B45309] hover:bg-[#92400E]'
+                  : 'bg-[#0D386B] hover:bg-[#0A2C55]'
+              }`}
+            >
+              {isPollingGrab ? (
+                <>
+                  <Square className="h-3.5 w-3.5" />
+                  停止轮询
+                </>
+              ) : (
+                <>
+                  <Radio className="h-3.5 w-3.5" />
+                  开启轮询找座
+                </>
+              )}
+            </button>
+          </div>
         </div>
       </div>
 
@@ -410,7 +697,7 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
             <div className="rounded-xl border border-dashed border-[#CBD5E1] bg-[#F8FAFC] py-14 text-center text-sm text-[#4D627A]">
               {refreshing && !data
                 ? '正在获取该区域座位列表...'
-                : '当前筛选条件下没有可显示的座位。'}
+                : '当前筛选条件下没有可显示的座位，可切换筛选或开启上方「轮询找座」。'}
             </div>
           ) : (
             <div className="grid grid-cols-4 gap-2 sm:grid-cols-6 md:grid-cols-8">
@@ -433,18 +720,18 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
                       setSelectedSeat(seat);
                       setFeedback(null);
                     }}
-                    className={`relative flex flex-col items-center justify-center rounded-lg border px-2 py-2.5 transition-all ${statusClass} ${
+                    className={`relative flex flex-col items-center justify-center rounded-lg border px-1.5 py-2.5 transition-all ${statusClass} ${
                       isSelected ? 'ring-2 ring-[#0D386B] ring-offset-1' : ''
                     }`}
                   >
                     <span className="font-mono text-xs font-bold tabular-nums">
                       {String(seat.seatNumber).padStart(3, '0')}
                     </span>
-                    <span className="mt-1 text-[10px] opacity-80">
+                    <span className="mt-1 text-[10px] leading-tight opacity-85">
                       {seat.status === 'free'
-                        ? '全空'
+                        ? '全时段可约'
                         : seat.status === 'partial'
-                          ? `${seat.freeRate}%`
+                          ? '部分可约'
                           : seat.status === 'unreleased'
                             ? '未放座'
                             : '已满'}
@@ -484,9 +771,9 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
                     }`}
                   >
                     {selectedSeat.status === 'free'
-                      ? '全时段空闲'
+                      ? '全时段可约'
                       : selectedSeat.status === 'partial'
-                        ? `部分空闲 (${selectedSeat.freeRate}%)`
+                        ? `部分时段可约 (${selectedSeat.freeRate}%)`
                         : selectedSeat.status === 'unreleased'
                           ? '该批次未放座'
                           : '该时段已约满'}
@@ -530,7 +817,9 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
 
               {/* Free Slots */}
               <div>
-                <p className="text-xs font-medium text-[#4D627A]">可用空闲时间段（点击填入）</p>
+                <p className="text-xs font-medium text-[#4D627A]">
+                  校准后可用空闲时间段（点击填入）
+                </p>
                 {selectedSeat.status === 'unreleased' ? (
                   <p className="mt-1.5 text-xs text-[#0D386B]">
                     {data?.batchStatus?.message ||
@@ -538,7 +827,7 @@ export const SeatSelector: React.FC<SeatSelectorProps> = ({
                   </p>
                 ) : selectedSeat.freeSlots.length === 0 ? (
                   <p className="mt-1.5 text-xs text-red-600">
-                    当前查询时段内没有剩余空档，建议将该座加入「18:01 定时抢座 / 轮询捡漏」。
+                    当前校准时段内没有剩余空档，可开启上方「轮询找座」或将该座加入「18:01 定时抢座」。
                   </p>
                 ) : (
                   <div className="mt-2 flex flex-wrap gap-2">

@@ -147,6 +147,14 @@ describe('DLUFL Library System Core Flows', () => {
     const freeSeat = seatsRes.seats.find((s) => s.status === 'free');
     assert.ok(freeSeat, 'Expected at least one free seat in mock mode');
 
+    // 验证可约时间校准：若当前北京时间 14:20 已在空闲区间 [08:30, 22:00] 中途，应自动校准为 14:22-22:00 且仍可预约
+    const midDayNow = new Date(`${todayDate}T14:20:00+08:00`);
+    const cal = icspService.calibrateTimeRange(todayDate, '08:30', '22:00', midDayNow);
+    assert.equal(cal.calibrated, true);
+    assert.equal(cal.effectiveStartTime, '14:22');
+    assert.equal(cal.effectiveEndTime, '22:00');
+    assert.equal(cal.hasValidWindow, true);
+
     // 未放座批次（后天+）不应显示为全空，应明确标记为 unreleased
     const futureDate = schedulerService.computeTargetDate(new Date(), 3);
     const futureRes = await icspService.fetchAreaSeats(

@@ -298,9 +298,8 @@ export default function App() {
         {activeTab === 'cards' && <CardQueryPanel user={user} />}
       </main>
 
-      <footer className="mt-auto w-full border-t border-[#DCE4EE] bg-white py-4 text-xs text-[#64748B]">
-        <div className="flex w-full flex-wrap items-center justify-between gap-2 px-4 sm:px-6">
-          <span>大连外国语大学图书馆座位预约与定时抢座系统 · NestJS + React</span>
+      <footer className="mt-auto w-full border-t border-[#DCE4EE] bg-white py-3.5 text-xs text-[#64748B]">
+        <div className="flex w-full items-center justify-end px-4 sm:px-6">
           <span className="font-mono">
             累计成功约座 {overview?.totalSuccessfulBookings ?? 0} 次 · 系统累计访问{' '}
             {overview?.totalVisits ?? 0} 次

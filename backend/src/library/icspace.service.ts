@@ -484,15 +484,7 @@ export class IcspService {
     return seats;
   }
 
-  /**
-   * 统一按北京时间 (Asia/Shanghai) 计算图书馆放座批次状态：
-   * 规则：每天 18:00 开放次日座位。
-   * - targetDate < 今日：已过期
-   * - targetDate === 今日：已放座（22:00 后提示已闭馆）
-   * - targetDate === 明日：今日 18:00 前为 unreleased（未放座），18:00 及之后为 open
-   * - targetDate > 明日：unreleased（未放座，将于目标日期前一天 18:00 开放）
-   */
-  getBatchReleaseStatus(targetDate: string, now = new Date()): BatchReleaseStatus {
+  private getBeijingNowInfo(now = new Date()) {
     const bjParts = new Intl.DateTimeFormat('en-CA', {
       timeZone: 'Asia/Shanghai',
       year: 'numeric',
@@ -504,10 +496,66 @@ export class IcspService {
     }).formatToParts(now);
 
     const get = (type: string) => bjParts.find((p) => p.type === type)?.value || '00';
-    const todayStr = `${get('year')}-${get('month')}-${get('day')}`;
-    const currentMin = Number(get('hour')) * 60 + Number(get('minute'));
+    return {
+      year: Number(get('year')),
+      month: Number(get('month')),
+      day: Number(get('day')),
+      todayStr: `${get('year')}-${get('month')}-${get('day')}`,
+      currentMin: Number(get('hour')) * 60 + Number(get('minute')),
+    };
+  }
 
-    const todayUtc = Date.UTC(Number(get('year')), Number(get('month')) - 1, Number(get('day')));
+  /**
+   * 校准实际可预约时间范围：
+   * - 当 targetDate 为今日且用户所选开始时间已早于当前北京时间时，自动校准为「当前时间 + 2 分钟」
+   * - 保证轮询或手动预约在空闲区间中途开始时，依然可以直接从当前时刻起约到该空位
+   */
+  calibrateTimeRange(
+    targetDate: string,
+    requestedStart: string,
+    requestedEnd: string,
+    now = new Date(),
+  ) {
+    const bj = this.getBeijingNowInfo(now);
+    const reqStartMin = this.timeToMinutes(requestedStart);
+    const reqEndMin = this.timeToMinutes(requestedEnd);
+
+    let effectiveStartMin = reqStartMin;
+    let calibrated = false;
+    if (targetDate === bj.todayStr) {
+      const minBookableNow = Math.min(22 * 60, bj.currentMin + 2);
+      if (minBookableNow > effectiveStartMin) {
+        effectiveStartMin = minBookableNow;
+        calibrated = true;
+      }
+    }
+
+    const effectiveEndMin = reqEndMin;
+    const hasValidWindow = effectiveEndMin - effectiveStartMin >= 30;
+    return {
+      effectiveStartMin,
+      effectiveEndMin,
+      effectiveStartTime: this.minutesToTime(effectiveStartMin),
+      effectiveEndTime: this.minutesToTime(effectiveEndMin),
+      calibrated,
+      hasValidWindow,
+    };
+  }
+
+  /**
+   * 统一按北京时间 (Asia/Shanghai) 计算图书馆放座批次状态：
+   * 规则：每天 18:00 开放次日座位。
+   * - targetDate < 今日：已过期
+   * - targetDate === 今日：已放座（22:00 后提示已闭馆）
+   * - targetDate === 明日：今日 18:00 前为 unreleased（未放座），18:00 及之后为 open
+   * - targetDate > 明日：unreleased（未放座，将于目标日期前一天 18:00 开放）
+   */
+  getBatchReleaseStatus(targetDate: string, now = new Date()): BatchReleaseStatus {
+    const bj = this.getBeijingNowInfo(now);
+    const todayStr = bj.todayStr;
+    const currentMin = bj.currentMin;
+
+    const todayUtc = Date.UTC(bj.year, bj.month - 1, bj.day);
     const [ty, tm, td] = targetDate.split('-').map(Number);
     const targetUtc = Date.UTC(ty, tm - 1, td);
     const diffDays = Math.round((targetUtc - todayUtc) / (24 * 60 * 60 * 1000));
@@ -572,6 +620,9 @@ export class IcspService {
     targetDate: string;
     startTime: string;
     endTime: string;
+    effectiveStartTime: string;
+    effectiveEndTime: string;
+    timeCalibrated: boolean;
     isLive: boolean;
     batchStatus: BatchReleaseStatus;
     notice?: string;
@@ -584,14 +635,20 @@ export class IcspService {
     }
 
     const batchStatus = this.getBatchReleaseStatus(targetDate);
+    const calibratedRange = this.calibrateTimeRange(targetDate, startTime, endTime);
 
     if (appConfig.mockMode) {
-      const seats = this.generateMockSeats(area, targetDate, startTime, endTime).map((s) =>
-        batchStatus.bookable
+      const seats = this.generateMockSeats(
+        area,
+        targetDate,
+        calibratedRange.effectiveStartTime,
+        calibratedRange.effectiveEndTime,
+      ).map((s) =>
+        batchStatus.bookable && calibratedRange.hasValidWindow
           ? s
           : {
               ...s,
-              status: 'unreleased' as const,
+              status: batchStatus.bookable ? ('occupied' as const) : ('unreleased' as const),
               freeRate: 0,
               longestFreeSlot: null,
               freeSlots: [],
@@ -602,18 +659,23 @@ export class IcspService {
         targetDate,
         startTime,
         endTime,
+        effectiveStartTime: calibratedRange.effectiveStartTime,
+        effectiveEndTime: calibratedRange.effectiveEndTime,
+        timeCalibrated: calibratedRange.calibrated,
         isLive: false,
         batchStatus,
         notice: batchStatus.bookable
-          ? '当前处于演练模式（ICSPACE_MOCK_MODE=true），座位状态由本地模拟器与真实预约库联合生成。'
+          ? calibratedRange.hasValidWindow
+            ? '当前处于演练模式（ICSPACE_MOCK_MODE=true），座位状态由本地模拟器与真实预约库联合生成。'
+            : '当前所选结束时间距现在不足 30 分钟，请调晚结束时间或切换明日批次。'
           : batchStatus.message,
         summary: this.summarizeSeats(seats),
         seats,
       };
     }
 
-    const startMin = this.timeToMinutes(startTime);
-    const endMin = this.timeToMinutes(endTime);
+    const startMin = calibratedRange.effectiveStartMin;
+    const endMin = calibratedRange.effectiveEndMin;
     const compactDate = targetDate.replace(/-/g, '');
     const apiUrl = `${appConfig.icspace.host}/ic-web/reserve?roomIds=${area.id}&resvDates=${compactDate}&sysKind=8&_=${Date.now()}`;
 
@@ -666,6 +728,9 @@ export class IcspService {
           targetDate,
           startTime,
           endTime,
+          effectiveStartTime: calibratedRange.effectiveStartTime,
+          effectiveEndTime: calibratedRange.effectiveEndTime,
+          timeCalibrated: calibratedRange.calibrated,
           isLive: false,
           batchStatus,
           notice: !user
@@ -723,6 +788,21 @@ export class IcspService {
         };
       }
 
+      if (!calibratedRange.hasValidWindow) {
+        return {
+          devId: String(device.devId),
+          devName,
+          seatNumber,
+          areaId: area.id,
+          areaName: area.name,
+          status: 'occupied' as const,
+          freeRate: 0,
+          longestFreeSlot: null,
+          freeSlots: [],
+          busySlots: [],
+        };
+      }
+
       const { busySlots, freeSlots, longestFreeSlot, freeRate } =
         this.computeSeatIntervals(device.resvInfo || [], startMin, endMin);
 
@@ -769,6 +849,9 @@ export class IcspService {
       targetDate,
       startTime,
       endTime,
+      effectiveStartTime: calibratedRange.effectiveStartTime,
+      effectiveEndTime: calibratedRange.effectiveEndTime,
+      timeCalibrated: calibratedRange.calibrated,
       isLive: true,
       batchStatus: effectiveBatchStatus,
       notice: finalNotice,
@@ -807,8 +890,23 @@ export class IcspService {
     const area = this.getAreaById(params.areaId);
     const areaName = area?.name || params.areaId;
 
-    const startTimeNorm = params.startTime.length === 5 ? `${params.startTime}:00` : params.startTime;
-    const endTimeNorm = params.endTime.length === 5 ? `${params.endTime}:00` : params.endTime;
+    // 预约前再次按北京时间校准开始时间，确保轮询过程中即使处于空闲区间中途也能立即起约
+    const calibrated = this.calibrateTimeRange(
+      params.targetDate,
+      params.startTime.slice(0, 5),
+      params.endTime.slice(0, 5),
+    );
+    if (!calibrated.hasValidWindow) {
+      return {
+        success: false,
+        message: '可预约时长不足 30 分钟，请调晚结束时间或切换至明日批次',
+      };
+    }
+
+    const actualStart = calibrated.effectiveStartTime;
+    const actualEnd = calibrated.effectiveEndTime;
+    const startTimeNorm = `${actualStart}:00`;
+    const endTimeNorm = `${actualEnd}:00`;
 
     let success = false;
     let message = '';
@@ -831,7 +929,7 @@ export class IcspService {
       } else {
         success = true;
         remoteResvId = `MOCK-${Date.now()}`;
-        message = `成功预约 ${areaName} ${params.seatName} (${params.targetDate} ${params.startTime}-${params.endTime})`;
+        message = `成功预约 ${areaName} ${params.seatName} (${params.targetDate} ${actualStart}-${actualEnd})`;
       }
     } else {
       for (let attempt = 0; attempt < 2; attempt++) {
@@ -867,7 +965,7 @@ export class IcspService {
           if (response.data?.code === 0) {
             success = true;
             remoteResvId = String(response.data?.data?.uuid || response.data?.data?.resvId || '');
-            message = `成功预约 ${areaName} ${params.seatName} (${params.targetDate} ${params.startTime}-${params.endTime})`;
+            message = `成功预约 ${areaName} ${params.seatName} (${params.targetDate} ${actualStart}-${actualEnd})`;
             break;
           }
 
@@ -909,8 +1007,8 @@ export class IcspService {
           params.devId,
           params.seatName,
           params.targetDate,
-          params.startTime,
-          params.endTime,
+          actualStart,
+          actualEnd,
           params.source,
           params.scheduleId ?? null,
           success ? 'success' : 'failed',
@@ -945,8 +1043,14 @@ export class IcspService {
       forceFullRange: boolean;
     },
   ): Promise<{ seat: SeatInfo; slot: TimeSlot } | null> {
-    const startMin = this.timeToMinutes(options.startTime);
-    const endMin = this.timeToMinutes(options.endTime);
+    const calibrated = this.calibrateTimeRange(
+      options.targetDate,
+      options.startTime,
+      options.endTime,
+    );
+    if (!calibrated.hasValidWindow) return null;
+    const startMin = calibrated.effectiveStartMin;
+    const endMin = calibrated.effectiveEndMin;
 
     for (const areaId of options.areaIds) {
       try {
